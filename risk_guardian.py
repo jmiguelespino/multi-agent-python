@@ -2,19 +2,14 @@
 =============================================================================
 QUANTEDGE AI — MÓDULO DE GESTIÓN DE RIESGO INSTITUCIONAL Y CIRCUIT BREAKERS
 =============================================================================
-🔧 v1.7.1:
-  • 🐛 SIZING CORREGIDO: contract_size se obtiene de MT5 si está disponible.
-    Antes se usaba un fallback con multiplicadores `*100` que sobreestimaba
-    el riesgo en cripto y forzaba caps artificiales.
-  • 🐛 CAPS por clase revisados:
-      CRYPTO_MAX_LOT_SIZE default 0.10 (antes 1.0 en .env del usuario).
-      US500_MAX_LOT_SIZE default 0.50 (antes 1.0).
+🔧 v1.7.2:
+  • 🐛 FIX CRÍTICO: falso positivo del Circuit Breaker.
+    - Reset diario de métricas (drawdown, trades, circuit breaker).
+    - Rate limiter del log del CB (una vez cada 5 min).
+    - Inicialización de `_last_reset_date` y `_last_cb_log_ts`.
+  • 🐛 SIZING: contract_size real desde MT5.
+  • 🐛 CAPS por clase revisados (CRYPTO_MAX_LOT_SIZE default 0.10).
   • FIX: WTI y BRENT unificados como "OIL".
-  • Soporte para XAGUSD y US500.
-  • CRYPTO_MAX_RISK_PCT se aplica antes del sizing.
-  • Bloqueo PERMANENTE solo si el volume_min implica riesgo excesivo.
-  • Rate limiter para logs de spread (60s por símbolo).
-  • Lock con TTL.
 =============================================================================
 """
 import os
@@ -50,7 +45,6 @@ def is_us_market_hours() -> bool:
 
 
 def get_canonical_asset(symbol: str) -> str:
-    """WTI y BRENT devuelven "OIL" para unificar exposición."""
     if not symbol:
         return ""
     s = symbol.upper().replace(".RAW", "").replace("_RAW", "").strip()
@@ -78,10 +72,6 @@ def get_canonical_asset(symbol: str) -> str:
 
 
 def get_contract_size(symbol: str, canonical: str) -> float:
-    """
-    🐛 v1.7.1: obtiene el contract_size REAL del broker.
-    Si MT5 no responde, usa fallbacks por clase.
-    """
     try:
         info = mt5.symbol_info(symbol)
         if info and getattr(info, "trade_contract_size", 0) > 0:
@@ -89,7 +79,6 @@ def get_contract_size(symbol: str, canonical: str) -> float:
     except Exception:
         pass
 
-    # Fallbacks por clase
     if canonical == "XAU":
         return 100.0
     if canonical == "XAG":
@@ -106,7 +95,6 @@ def get_contract_size(symbol: str, canonical: str) -> float:
 
 
 def get_max_lot(canonical: str) -> float:
-    """Caps por clase de activo."""
     if canonical == "XAU":
         return float(os.getenv("GOLD_MAX_LOT_SIZE", "0.02"))
     if canonical == "XAG":
@@ -121,7 +109,6 @@ def get_max_lot(canonical: str) -> float:
 
 
 def get_risk_pct(canonical: str) -> float:
-    """Riesgo por trade según clase."""
     if canonical == "XAU":
         return float(os.getenv("GOLD_MAX_RISK_PCT", "0.3"))
     if canonical in ("BTC", "ETH", "SOL"):
@@ -133,6 +120,7 @@ class InstitutionalRiskGuardian:
     PENDING_LOCK_TTL_SECONDS = 30.0
     SPREAD_LOG_COOLDOWN_SEC = 60.0
     BROKER_MIN_TOLERANCE_MULT = 3.0
+    CB_LOG_COOLDOWN_SEC = 300.0  # 🐛 FIX: log CB cada 5 min
 
     def __init__(
         self,
@@ -165,6 +153,25 @@ class InstitutionalRiskGuardian:
         self._blocked_assets: Dict[str, str] = {}
         self._forced_min_volume: Dict[str, float] = {}
 
+        # 🐛 FIX: estado para reset diario y rate limiter
+        self._last_reset_date: str = self._today_utc()
+        self._last_cb_log_ts: float = 0.0
+
+    @staticmethod
+    def _today_utc() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def _check_daily_reset(self):
+        """🐛 FIX: resetea métricas diarias si cambió el día."""
+        today = self._today_utc()
+        if self._last_reset_date != today:
+            logger.info(f"🔄 Nuevo día UTC detectado ({today}). Reseteando métricas diarias.")
+            self._last_reset_date = today
+            self.trades_executed_today = 0
+            self.circuit_breaker_active = False
+            self.daily_peak_equity = self.current_equity
+            self.last_stop_loss_by_symbol.clear()
+
     def _prune_expired_locks(self):
         now = time.time()
         expired = [k for k, ts in self._pending_orders_lock.items() if now - ts > self.PENDING_LOCK_TTL_SECONDS]
@@ -185,6 +192,8 @@ class InstitutionalRiskGuardian:
         self.active_positions_count = len(symbols)
 
     def evaluate_order_risk(self, signal, current_market_spread_bps: float) -> RiskVerdict:
+        # 🐛 FIX: reset diario
+        self._check_daily_reset()
         self._prune_expired_locks()
 
         now = time.time()
@@ -210,15 +219,20 @@ class InstitutionalRiskGuardian:
         if drawdown_pct >= self.daily_drawdown_limit_pct or self.circuit_breaker_active:
             self.circuit_breaker_active = True
             msg = f"CIRCUIT BREAKER TRIPPED! Drawdown ({drawdown_pct:.2f}%) >= límite ({self.daily_drawdown_limit_pct}%)."
-            logger.critical(msg)
-            log_rejection(
-                symbol=symbol,
-                reason=msg,
-                event_type="CIRCUIT_BREAKER_TRIGGERED",
-                details=f"Pico: ${self.daily_peak_equity:.2f} | Equity: ${self.current_equity:.2f} | DD: {drawdown_pct:.2f}%",
-                side=side,
-                price=price
-            )
+
+            # 🐛 FIX: rate limiter del log
+            if now - self._last_cb_log_ts > self.CB_LOG_COOLDOWN_SEC:
+                logger.critical(msg)
+                self._last_cb_log_ts = now
+                log_rejection(
+                    symbol=symbol,
+                    reason=msg,
+                    event_type="CIRCUIT_BREAKER_TRIGGERED",
+                    details=f"Pico: ${self.daily_peak_equity:.2f} | Equity: ${self.current_equity:.2f} | DD: {drawdown_pct:.2f}%",
+                    side=side,
+                    price=price
+                )
+
             return RiskVerdict(False, msg, 0.0, 0.0, 0.0, True)
 
         # 2. Cuota Diaria
@@ -262,7 +276,7 @@ class InstitutionalRiskGuardian:
             )
             return RiskVerdict(False, msg, 0.0, 0.0, 0.0, False)
 
-        # 4. Doble exposición por activo canónico (WTI y BRENT son "OIL")
+        # 4. Doble exposición por activo canónico
         has_same_asset = any(get_canonical_asset(s) == canonical_sym for s in self.active_symbols)
         if has_same_asset:
             msg = f"Ya existe una posición activa en {symbol} ({canonical_sym})."
@@ -309,7 +323,6 @@ class InstitutionalRiskGuardian:
             return RiskVerdict(False, msg, 0.0, 0.0, 0.0, False)
 
         # 7. Sizing dinámico
-        # 🐛 v1.7.1: usar helpers get_risk_pct y get_contract_size
         risk_pct = get_risk_pct(canonical_sym)
         risk_usd = self.current_equity * (risk_pct / 100.0)
 
@@ -320,16 +333,12 @@ class InstitutionalRiskGuardian:
             log_rejection(symbol=symbol, reason=err_msg, side=side, price=price)
             return RiskVerdict(False, err_msg, 0.0, 0.0, 0.0, False)
 
-        # 🐛 v1.7.1: contract_size real desde MT5
         contract_size = get_contract_size(symbol, canonical_sym)
-
         calculated_size = round(risk_usd / (stop_distance * contract_size), 2)
 
-        # 🐛 v1.7.1: caps por clase
         max_lot = get_max_lot(canonical_sym)
         calculated_size = min(calculated_size, max_lot)
 
-        # Ajuste a volume_min/step de MT5
         s_info = mt5.symbol_info(symbol) if hasattr(mt5, 'symbol_info') else None
         if s_info:
             vol_step = getattr(s_info, 'volume_step', 0.01)
@@ -340,7 +349,6 @@ class InstitutionalRiskGuardian:
 
         calculated_size = max(0.01, round(calculated_size, 2))
 
-        # FIX: si volume_min del broker > cap, comprobar viabilidad
         if s_info:
             broker_min = getattr(s_info, 'volume_min', 0.01)
             if broker_min > max_lot:
