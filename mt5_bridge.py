@@ -2,10 +2,13 @@
 =============================================================================
 QUANTEDGE AI — METATRADER 5 (IC MARKETS) REAL-TIME LOCAL BRIDGE (UTC+3)
 =============================================================================
-🔧 FIX:
+🔧 v1.7.0:
+  • FIX #1: get_canonical_asset unifica WTI y BRENT bajo "OIL"
+    (evita doble exposición a petróleo desde el bridge).
   • resolve_symbol_name ya no devuelve dentro del for.
   • history_deals_get se cachea cada 60s (antes: cada 0.5s).
-  • execute_order usa lock global y try/finally.
+  • execute_order usa throttling monotónico y estructura try/finally.
+=============================================================================
 """
 import asyncio
 import json
@@ -21,12 +24,14 @@ import MetaTrader5 as mt5
 
 TZ_MT5 = timezone(timedelta(hours=3))
 
+
 class MT5TimeFormatter(logging.Formatter):
     def formatTime(self, record, datefmt=None):
         dt = datetime.fromtimestamp(record.created, tz=TZ_MT5)
         if datefmt:
             return dt.strftime(datefmt)
         return dt.isoformat()
+
 
 handler = logging.StreamHandler()
 handler.setFormatter(MT5TimeFormatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
@@ -53,8 +58,10 @@ _HISTORY_CACHE_TTL = 60.0
 def get_mt5_timestamp_ms() -> int:
     return int(datetime.now(TZ_MT5).timestamp() * 1000)
 
+
 def get_mt5_iso_time() -> str:
     return datetime.now(TZ_MT5).isoformat()
+
 
 def init_mt5() -> bool:
     logger.info("Iniciando conexión con MetaTrader 5...")
@@ -160,7 +167,7 @@ def get_account_payload():
         "marginFree": round(info.margin_free, 2),
         "positions": positions,
         "positionsCount": len(positions),
-        "closedTrades": _fetch_closed_trades_cached(),  # 🔧 cacheado
+        "closedTrades": _fetch_closed_trades_cached(),
         "timestamp": get_mt5_timestamp_ms(),
         "isoTime": get_mt5_iso_time()
     }
@@ -205,6 +212,11 @@ def get_market_snapshot():
 
 
 def get_canonical_asset(sym: str) -> str:
+    """
+    🔧 FIX #1 (v1.7.0): WTI y BRENT comparten el canónico "OIL"
+    para evitar doble exposición al mismo subyacente (crudo).
+    Coherente con risk_guardian.py y execution_agent.py.
+    """
     if not sym:
         return ""
     s = str(sym).upper().replace(".RAW", "").replace("_RAW", "").strip()
@@ -216,14 +228,17 @@ def get_canonical_asset(sym: str) -> str:
         return "SOL"
     if "XAU" in s or "GOLD" in s or "ORO" in s:
         return "XAU"
-    if "WTI" in s or "XTI" in s or "USO" in s or "CRUDE" in s or "OIL" in s or "PETROLEO" in s:
-        return "WTI"
-    if "BRENT" in s or "XBR" in s or "UKO" in s:
-        return "BRENT"
+    if "XAG" in s or "SILVER" in s or "PLATA" in s:
+        return "XAG"
+    # 🔧 FIX #1: WTI y BRENT unificados bajo OIL
+    if any(k in s for k in ("WTI", "XTI", "USO", "CRUDE", "OIL", "PETROLEO", "BRENT", "XBR", "UKO")):
+        return "OIL"
     if "EUR" in s:
         return "EURUSD"
     if "GBP" in s:
         return "GBPUSD"
+    if "US500" in s or "SPX" in s or "SP500" in s:
+        return "US500"
     return s
 
 
@@ -276,7 +291,12 @@ ORDER_THROTTLE_SECONDS = 0.5
 
 
 def execute_order(data: dict) -> dict:
-    """🔧 FIX: usa try/finally para garantizar consistencia y lock monotónico."""
+    """
+    🔧 v1.7.0:
+      - Throttle monotónico de 500ms.
+      - Estructura try/finally para garantizar consistencia.
+      - Anti-doble-exposición vía get_canonical_asset (OIL unificado).
+    """
     global LAST_ORDER_TIMESTAMP
     now = time.monotonic()
     if now - LAST_ORDER_TIMESTAMP < ORDER_THROTTLE_SECONDS:
@@ -290,47 +310,51 @@ def execute_order(data: dict) -> dict:
     sl_raw = float(data.get("sl", 0.0))
     tp_raw = float(data.get("tp", 0.0))
 
-    current_positions = mt5.positions_get()
-    if current_positions:
-        req_canonical = get_canonical_asset(req_symbol)
-        for pos in current_positions:
-            pos_canonical = get_canonical_asset(pos.symbol)
-            if pos_canonical == req_canonical:
-                reject_msg = f"Ya existe una posición activa en {pos.symbol} (Ticket #{pos.ticket}) para el activo {req_canonical}. Orden rechazada por regla de 1 posición por activo."
-                logger.warning(f"🛡️ BLOQUEO DE RESGUARDO EN MT5: {reject_msg}")
-                return {
-                    "status": "REJECTED",
-                    "message": reject_msg,
-                    "ticket": pos.ticket,
-                    "symbol": pos.symbol
-                }
-
-    info = mt5.symbol_info(symbol)
-    if not info:
-        return {"status": "ERROR", "message": f"Símbolo {req_symbol} no encontrado en MT5"}
-
-    if not info.visible:
-        mt5.symbol_select(symbol, True)
-
-    tick = mt5.symbol_info_tick(symbol)
-    if not tick:
-        return {"status": "ERROR", "message": f"No hay precio tick para {symbol}"}
-
-    volume = normalize_volume(info, volume_raw)
-    price = round(tick.ask if side == "BUY" else tick.bid, info.digits)
-    sl, tp = validate_and_fix_stops(info, side, price, sl_raw, tp_raw)
-
-    order_type = mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL
-
-    filling_modes = [mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_RETURN]
-
-    if info.filling_mode & 1:
-        filling_modes = [mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_RETURN]
-    elif info.filling_mode & 2:
-        filling_modes = [mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN]
-
-    last_result = None
     try:
+        # 🛡️ Anti-doble-exposición (FIX #1): WTI y BRENT comparten "OIL"
+        current_positions = mt5.positions_get()
+        if current_positions:
+            req_canonical = get_canonical_asset(req_symbol)
+            for pos in current_positions:
+                pos_canonical = get_canonical_asset(pos.symbol)
+                if pos_canonical == req_canonical:
+                    reject_msg = (
+                        f"Ya existe una posición activa en {pos.symbol} (Ticket #{pos.ticket}) "
+                        f"para el activo {req_canonical}. Orden rechazada por regla de 1 posición por activo."
+                    )
+                    logger.warning(f"🛡️ BLOQUEO DE RESGUARDO EN MT5: {reject_msg}")
+                    return {
+                        "status": "REJECTED",
+                        "message": reject_msg,
+                        "ticket": pos.ticket,
+                        "symbol": pos.symbol
+                    }
+
+        info = mt5.symbol_info(symbol)
+        if not info:
+            return {"status": "ERROR", "message": f"Símbolo {req_symbol} no encontrado en MT5"}
+
+        if not info.visible:
+            mt5.symbol_select(symbol, True)
+
+        tick = mt5.symbol_info_tick(symbol)
+        if not tick:
+            return {"status": "ERROR", "message": f"No hay precio tick para {symbol}"}
+
+        volume = normalize_volume(info, volume_raw)
+        price = round(tick.ask if side == "BUY" else tick.bid, info.digits)
+        sl, tp = validate_and_fix_stops(info, side, price, sl_raw, tp_raw)
+
+        order_type = mt5.ORDER_TYPE_BUY if side == "BUY" else mt5.ORDER_TYPE_SELL
+
+        filling_modes = [mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_RETURN]
+
+        if info.filling_mode & 1:
+            filling_modes = [mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_RETURN]
+        elif info.filling_mode & 2:
+            filling_modes = [mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN]
+
+        last_result = None
         for fill_mode in filling_modes:
             request = {
                 "action": mt5.TRADE_ACTION_DEAL,
@@ -359,13 +383,19 @@ def execute_order(data: dict) -> dict:
                     "volume": volume,
                     "fillPrice": result.price
                 }
-    finally:
-        pass  # El lock se libera solo por throttle de tiempo
 
-    comment_err = last_result.comment if last_result else "Sin respuesta"
-    retcode_err = last_result.retcode if last_result else -1
-    logger.error(f"❌ Error MT5 al enviar orden: {retcode_err} ({comment_err})")
-    return {"status": "ERROR", "code": retcode_err, "comment": comment_err}
+        comment_err = last_result.comment if last_result else "Sin respuesta"
+        retcode_err = last_result.retcode if last_result else -1
+        logger.error(f"❌ Error MT5 al enviar orden: {retcode_err} ({comment_err})")
+        return {"status": "ERROR", "code": retcode_err, "comment": comment_err}
+
+    except Exception as e:
+        logger.error(f"❌ Excepción en execute_order: {e}")
+        return {"status": "ERROR", "message": str(e)}
+    finally:
+        # El throttle monotónico actúa como lock temporal.
+        # No se requiere liberación explícita.
+        pass
 
 
 async def handler(websocket):

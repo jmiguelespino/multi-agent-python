@@ -1,23 +1,26 @@
 """
 MÓDULO DE ESTRATEGIA CUANTITATIVA Y GENERACIÓN DE SEÑALES SNIPER (AGENTE 2)
 
-🔧 v1.4:
-  • Añadido soporte para XAGUSD (Plata) y US500 (S&P 500).
+🔧 v1.6:
+  • 🐛 BUG #3 CORREGIDO: _check_macro_trend ahora resuelve el símbolo real
+    en MT5 (con sufijo .raw, etc.) antes de pedir las velas M15.
+  • Añadidos logs debug cuando el filtro M15 rechaza una señal.
+  • EMA20 inicializada con SMA(5) para reducir el sesgo de arranque.
+  • Soporte para XAGUSD (Plata) y US500 (S&P 500).
   • Precisión decimal correcta por clase de activo.
-  • Confianza normalizada.
-  • Validación de stops coherentes.
-🔧 v1.5:
-  • FIX #2: Filtro de tendencia macro M15 (EMA20) para evitar comprar en
-    tendencia bajista o vender en tendencia alcista.
+  • FIX #2: Filtro de tendencia macro M15 (EMA20).
 """
 import os
 import time
+import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional
 from dotenv import load_dotenv
 
 load_dotenv()
+logger = logging.getLogger("SignalAgent")
+logger.propagate = False
 
 
 class SignalType(str, Enum):
@@ -67,6 +70,19 @@ class StrategySignalAgent:
         "FOREX": 5,
     }
 
+    # Mapeo de alias para resolver el símbolo real en MT5
+    _MT5_SYMBOL_ALIASES = {
+        "XAUUSD": ["XAUUSD", "GOLD", "XAUUSD.raw", "GOLD.raw"],
+        "XAGUSD": ["XAGUSD", "SILVER", "XAGUSD.raw", "SILVER.raw"],
+        "US500":  ["US500", "SP500", "SPX500", "US500.raw", "SP500.raw"],
+        "WTI":    ["XTIUSD", "WTI", "USOIL", "XTIUSD.raw", "WTI.raw"],
+        "XTIUSD": ["XTIUSD", "WTI", "USOIL", "XTIUSD.raw", "WTI.raw"],
+        "BRENT":  ["XBRUSD", "BRENT", "UKOIL", "XBRUSD.raw", "BRENT.raw"],
+        "XBRUSD": ["XBRUSD", "BRENT", "UKOIL", "XBRUSD.raw", "BRENT.raw"],
+        "EURUSD": ["EURUSD", "EURUSD.raw"],
+        "GBPUSD": ["GBPUSD", "GBPUSD.raw"],
+    }
+
     def __init__(
         self,
         symbol: str = "XAUUSD",
@@ -86,6 +102,9 @@ class StrategySignalAgent:
         self.is_index = any(idx in sym_upper for idx in ["US500", "SP500", "SPX", "NAS100", "US30", "GER40", "UK100"])
 
         self.precision = self._get_precision()
+
+        # Cache del símbolo resuelto para MT5 (evita resolver en cada tick)
+        self._resolved_mt5_symbol: Optional[str] = None
 
         if self.is_gold:
             default_sl = float(os.getenv("GOLD_ATR_STOP_MULTIPLIER", "4.5"))
@@ -134,35 +153,90 @@ class StrategySignalAgent:
             return self.PRECISION_BY_CLASS["SOL"]
         return 2
 
+    def _resolve_mt5_symbol(self) -> str:
+        """
+        🐛 BUG #3 CORREGIDO.
+        Resuelve el símbolo lógico al símbolo real de MT5.
+        Por ejemplo: "WTI" → "XTIUSD.raw".
+        Cachea el resultado en self._resolved_mt5_symbol.
+        """
+        if self._resolved_mt5_symbol:
+            return self._resolved_mt5_symbol
+
+        try:
+            import MetaTrader5 as mt5
+            sym_upper = self.symbol.upper()
+
+            # Primero probar el símbolo tal cual
+            if mt5.symbol_info(self.symbol):
+                self._resolved_mt5_symbol = self.symbol
+                return self._resolved_mt5_symbol
+
+            # Probar aliases por clase
+            aliases = self._MT5_SYMBOL_ALIASES.get(sym_upper, [])
+            if not aliases:
+                # Fallback genérico
+                aliases = [f"{self.symbol}.raw", f"{self.symbol}_raw", f"{self.symbol}m"]
+
+            for alias in aliases:
+                if mt5.symbol_info(alias):
+                    self._resolved_mt5_symbol = alias
+                    logger.info(f"🔧 [M15] Símbolo '{self.symbol}' resuelto a '{alias}' en MT5")
+                    return alias
+
+            # No se encontró → usar el original (el filtro será fail-safe)
+            logger.warning(f"⚠️ [M15] No se pudo resolver símbolo '{self.symbol}' en MT5. Filtro M15 será fail-safe.")
+            self._resolved_mt5_symbol = self.symbol
+            return self._resolved_mt5_symbol
+        except Exception as e:
+            logger.debug(f"🔧 [M15] Error resolviendo símbolo '{self.symbol}': {e}")
+            return self.symbol
+
     def _check_macro_trend(self, signal_type_str: str, current_price: float) -> bool:
         """
         🔧 FIX #2: Verifica que la tendencia de 15min esté alineada con la señal.
         Retorna True si está alineada, False si no.
+
+        🐛 BUG #3 CORREGIDO: resuelve el símbolo real en MT5 antes de pedir las velas.
         """
         try:
             import MetaTrader5 as mt5
-            rates = mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_M15, 0, 30)
-            if rates is None or len(rates) < 20:
-                return True  # No hay datos suficientes, permitir
+            resolved_sym = self._resolve_mt5_symbol()
 
-            # Calcular EMA 20 en M15
+            rates = mt5.copy_rates_from_pos(resolved_sym, mt5.TIMEFRAME_M15, 0, 30)
+            if rates is None or len(rates) < 20:
+                return True  # Sin datos suficientes → permitir
+
+            # Calcular EMA 20 en M15 (inicialización con SMA de los primeros 5)
             closes = [r['close'] for r in rates[-20:]]
             k = 2.0 / (20 + 1)
-            ema20 = closes[0]
-            for c in closes[1:]:
+
+            # SMA inicial más robusta para los primeros 5 cierres
+            seed_len = min(5, len(closes))
+            ema20 = sum(closes[:seed_len]) / seed_len
+            for c in closes[seed_len:]:
                 ema20 = c * k + ema20 * (1 - k)
 
             # BUY solo si precio > EMA20_M15
             if signal_type_str == "BUY" and current_price < ema20:
+                logger.debug(
+                    f"🔍 [M15] BUY RECHAZADO en {self.symbol} ({resolved_sym}): "
+                    f"precio {current_price:.5f} < EMA20_M15 {ema20:.5f}"
+                )
                 return False
 
             # SELL solo si precio < EMA20_M15
             if signal_type_str == "SELL" and current_price > ema20:
+                logger.debug(
+                    f"🔍 [M15] SELL RECHAZADO en {self.symbol} ({resolved_sym}): "
+                    f"precio {current_price:.5f} > EMA20_M15 {ema20:.5f}"
+                )
                 return False
 
             return True
-        except Exception:
-            return True  # En caso de error, no bloquear
+        except Exception as e:
+            logger.debug(f"🔍 [M15] Fail-safe para {self.symbol}: {e}")
+            return True
 
     def evaluate(self, f) -> Optional[TradeSignal]:
         reasons: List[str] = []

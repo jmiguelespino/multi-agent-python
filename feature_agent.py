@@ -1,6 +1,8 @@
 """
 AGENTE 1: INGESTION & FEATURE ENGINEERING AGENT
-🔧 v1.3.1:
+
+🔧 v1.3.2:
+  • 🐛 MEJORA #5: añadidos MIN_ATR para XAG (Plata) y US500 (S&P 500).
   • ATR mínimo forzado por clase de activo (evita ATR=0 que rompe stops).
   • VWAP O(1) + ATR Wilder.
 """
@@ -46,11 +48,13 @@ class IngestionFeatureAgent:
     # 🔧 ATR mínimo por clase de activo (protege contra ATR=0)
     MIN_ATR_BY_CLASS = {
         "XAU": 0.50,      # Oro: mínimo $0.50
+        "XAG": 0.02,      # 🐛 MEJORA #5: Plata: mínimo $0.02
         "WTI": 0.05,      # Petróleo: mínimo $0.05
         "BRENT": 0.05,
         "BTC": 50.0,      # BTC: mínimo $50
         "ETH": 3.0,       # ETH: mínimo $3
         "SOL": 0.10,      # SOL: mínimo $0.10
+        "US500": 0.50,    # 🐛 MEJORA #5: S&P 500: mínimo 0.50 puntos
         "FOREX": 0.00015, # Forex: mínimo 1.5 pips
     }
 
@@ -86,6 +90,8 @@ class IngestionFeatureAgent:
         s = self.symbol.upper()
         if "XAU" in s or "GOLD" in s:
             return self.MIN_ATR_BY_CLASS["XAU"]
+        if "XAG" in s or "SILVER" in s:  # 🐛 MEJORA #5
+            return self.MIN_ATR_BY_CLASS["XAG"]
         if "WTI" in s or "XTI" in s or "OIL" in s:
             return self.MIN_ATR_BY_CLASS["WTI"]
         if "BRENT" in s or "XBR" in s:
@@ -96,6 +102,8 @@ class IngestionFeatureAgent:
             return self.MIN_ATR_BY_CLASS["ETH"]
         if "SOL" in s:
             return self.MIN_ATR_BY_CLASS["SOL"]
+        if "US500" in s or "SP500" in s or "SPX" in s:  # 🐛 MEJORA #5
+            return self.MIN_ATR_BY_CLASS["US500"]
         if any(fx in s for fx in ["EUR", "GBP", "JPY", "AUD", "NZD"]):
             return self.MIN_ATR_BY_CLASS["FOREX"]
         return 0.001
@@ -185,7 +193,6 @@ class IngestionFeatureAgent:
 
         rsi = self._calculate_rsi(price)
 
-        # 🔧 FIX: ATR nunca menor al mínimo por activo
         atr_raw = self.atr14 if self.atr14 is not None else self._default_atr()
         atr = max(atr_raw, self._get_min_atr())
 
@@ -218,7 +225,6 @@ class IngestionFeatureAgent:
         prev_c = prev.close
         tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
 
-        # 🔧 Ignorar TR = 0 (candle sin movimiento)
         if tr <= 0:
             return
 
@@ -231,6 +237,8 @@ class IngestionFeatureAgent:
         s = self.symbol.upper()
         if "XAU" in s or "GOLD" in s:
             return 2.50
+        if "XAG" in s or "SILVER" in s:  # 🐛 MEJORA #5: default para plata
+            return 0.05
         if "BTC" in s:
             return 150.0
         if "ETH" in s:
@@ -241,6 +249,8 @@ class IngestionFeatureAgent:
             return 0.30
         if "BRENT" in s or "XBR" in s:
             return 0.30
+        if "US500" in s or "SP500" in s:  # 🐛 MEJORA #5: default para índice
+            return 5.0
         if any(fx in s for fx in ["EUR", "GBP"]):
             return 0.0015
         return 1.50
@@ -267,7 +277,6 @@ class IngestionFeatureAgent:
         self.avg_gain = (self.avg_gain * 13 + gain) / 14
         self.avg_loss = (self.avg_loss * 13 + loss) / 14
 
-        # 🔧 Si ambos son 0, devolver 50 (neutral) en lugar de 100
         if self.avg_gain == 0.0 and self.avg_loss == 0.0:
             return 50.0
         if self.avg_loss == 0.0:

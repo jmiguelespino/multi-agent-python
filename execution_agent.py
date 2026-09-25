@@ -1,16 +1,20 @@
 """
 MÓDULO DE EJECUCIÓN INSTITUCIONAL Y OMS (AGENTE 4)
 
-🔧 v1.2:
+🔧 v1.4:
+  • 🐛 BUG #4 CORREGIDO: pnl_percent ahora usa contract_size real del símbolo
+    (antes usaba un *100 fijo incorrecto).
+  • 🐛 BUG #5 CORREGIDO: cuando no se encuentran deals para un ticket,
+    se marca como "UNKNOWN" en lugar de "MANUAL_CLOSE" silencioso,
+    y se loguea warning para diagnóstico.
+  • FIX #1: WTI y BRENT unificados como "OIL" en get_canonical_asset().
+  • Soporte para XAG (Plata) y US500 (S&P 500) en canónico.
   • _update_mt5_sl valida SL contra el precio actual antes de enviar.
   • Auto-ajuste del SL para respetar stops_level del broker.
   • Warning de "Invalid stops" solo 1 vez por ticket.
   • PnL real desde MT5.
   • log_position_closed correctamente llamado.
   • logger.propagate = False.
-🔧 v1.3:
-  • FIX #1: WTI y BRENT unificados como "OIL" en get_canonical_asset().
-  • Añadido soporte para XAG (Plata) y US500 (S&P 500) en canónico.
 """
 import os
 import asyncio
@@ -38,7 +42,7 @@ logger.propagate = False
 def get_canonical_asset(symbol: str) -> str:
     """
     🔧 v1.3: WTI y BRENT devuelven "OIL" para unificar exposición.
-    Consistente con risk_guardian.get_canonical_asset().
+    Consistente con risk_guardian.get_canonical_asset() y mt5_bridge.get_canonical_asset().
     """
     if not symbol:
         return ""
@@ -102,7 +106,6 @@ class ExecutionOMSAgent:
         self.closed_orders: List[BracketOrder] = []
         self._reported_tickets: set = set()
 
-        # 🔧 v1.2: set de tickets cuyo warning de SL ya se mostró
         self._sl_warning_shown: set = set()
 
         self.be_trigger_atr = float(os.getenv("BREAK_EVEN_ATR_TRIGGER", "1.2"))
@@ -112,8 +115,42 @@ class ExecutionOMSAgent:
         self.magic_number = int(os.getenv("MAGIC_NUMBER", "992026"))
 
     @staticmethod
+    def _get_contract_size(symbol: str) -> float:
+        """
+        🐛 BUG #4 CORREGIDO: obtiene el contract_size real del símbolo desde MT5.
+        Fallback a valores conocidos si MT5 no está disponible.
+        """
+        try:
+            info = mt5.symbol_info(symbol)
+            if info and getattr(info, "trade_contract_size", 0) > 0:
+                return float(info.trade_contract_size)
+        except Exception:
+            pass
+
+        s = symbol.upper()
+        if "XAU" in s or "GOLD" in s:
+            return 100.0
+        if "XAG" in s or "SILVER" in s:
+            return 1000.0
+        if any(fx in s for fx in ["EUR", "GBP", "AUD", "NZD", "USDJPY", "CHF", "CAD"]):
+            return 100000.0
+        if any(o in s for o in ["WTI", "XTI", "BRENT", "XBR", "OIL"]):
+            return 100.0
+        if "US500" in s or "SP500" in s:
+            return 1.0
+        return 1.0
+
+    @staticmethod
     def _fetch_realized_pnl_from_mt5(ticket: int) -> tuple[float, float, str]:
-        """Obtiene el PnL real de un ticket cerrado desde el historial de MT5."""
+        """
+        Obtiene el PnL real de un ticket cerrado desde el historial de MT5.
+
+        🐛 BUG #5 CORREGIDO:
+          - Si no se encuentran deals para el ticket → reason="UNKNOWN"
+            (antes se ponía "MANUAL_CLOSE" en silencio, lo que contaminaba el learner).
+          - Se loguea warning cuando no se encuentran deals.
+          - Se separa el caso "ticket encontrado pero sin deals" del "MT5 sin historial".
+        """
         try:
             from datetime import datetime, timedelta, timezone as _tz
             tz_mt5 = _tz(timedelta(hours=3))
@@ -121,39 +158,63 @@ class ExecutionOMSAgent:
             to_date = datetime.now(tz_mt5) + timedelta(days=1)
 
             deals = mt5.history_deals_get(from_date, to_date, position=ticket)
-            if not deals:
-                deals = mt5.history_deals_get(from_date, to_date)
+            used_filtered = deals is not None and len(deals) > 0
+
+            if not used_filtered:
+                # Fallback: pedir todo y filtrar en Python
+                all_deals = mt5.history_deals_get(from_date, to_date)
+                if all_deals:
+                    deals = [d for d in all_deals
+                             if (getattr(d, "position_id", None) or getattr(d, "position", None)) == ticket]
+                else:
+                    deals = None
 
             if not deals:
-                return 0.0, 0.0, "MANUAL_CLOSE"
+                # 🐛 BUG #5: no inventar "MANUAL_CLOSE", marcar como UNKNOWN
+                logger.warning(
+                    f"⚠️ No se encontraron deals en MT5 para el ticket #{ticket}. "
+                    f"PnL se registrará como 0.0 con reason=UNKNOWN."
+                )
+                return 0.0, 0.0, "UNKNOWN"
 
             total_profit = 0.0
             total_commission = 0.0
             total_swap = 0.0
             close_price = 0.0
-            reason = "MANUAL_CLOSE"
+            reason = "UNKNOWN"
 
             for d in deals:
                 pid = getattr(d, "position_id", None) or getattr(d, "position", None)
-                if pid == ticket:
-                    total_profit += getattr(d, "profit", 0.0)
-                    total_commission += getattr(d, "commission", 0.0)
-                    total_swap += getattr(d, "swap", 0.0)
-                    if getattr(d, "entry", None) == mt5.DEAL_ENTRY_OUT:
-                        close_price = d.price
-                        comment = (d.comment or "").lower()
-                        if "tp" in comment or "take" in comment:
-                            reason = "TAKE_PROFIT"
-                        elif "sl" in comment or "stop" in comment:
-                            reason = "STOP_LOSS"
-                        elif "trail" in comment:
-                            reason = "TRAILING_STOP"
+                if pid != ticket:
+                    continue
+
+                total_profit += getattr(d, "profit", 0.0)
+                total_commission += getattr(d, "commission", 0.0)
+                total_swap += getattr(d, "swap", 0.0)
+
+                if getattr(d, "entry", None) == mt5.DEAL_ENTRY_OUT:
+                    close_price = d.price
+                    comment = (d.comment or "").lower()
+                    if "tp" in comment or "take" in comment:
+                        reason = "TAKE_PROFIT"
+                    elif "sl" in comment or "stop" in comment:
+                        reason = "STOP_LOSS"
+                    elif "trail" in comment:
+                        reason = "TRAILING_STOP"
+                    else:
+                        reason = "MANUAL_CLOSE"
 
             total_pnl = total_profit + total_commission + total_swap
+
+            # Si no se identificó razón clara, dejarlo como MANUAL_CLOSE
+            # solo si encontramos al menos un DEAL_ENTRY_OUT para este ticket
+            if reason == "UNKNOWN" and close_price > 0:
+                reason = "MANUAL_CLOSE"
+
             return round(total_pnl, 2), close_price, reason
         except Exception as e:
             logger.error(f"Error obteniendo PnL real del ticket #{ticket}: {e}")
-            return 0.0, 0.0, "MANUAL_CLOSE"
+            return 0.0, 0.0, "UNKNOWN"
 
     def sync_mt5_positions(self, raw_positions, risk_guardian: Optional[Any] = None):
         if raw_positions is None:
@@ -214,8 +275,13 @@ class ExecutionOMSAgent:
                 if risk_guardian:
                     risk_guardian.register_trade_closed(pnl_usd=pnl_usd, symbol=closed_order.symbol)
 
+                # 🐛 BUG #4 CORREGIDO: pnl_percent con contract_size real
+                contract_size = self._get_contract_size(closed_order.symbol)
+                notional = closed_order.entry_price * closed_order.quantity * contract_size
+                pnl_percent = (pnl_usd / notional) * 100.0 if notional > 0 else 0.0
+
                 duration_sec = int(time.time() - closed_order.entry_timestamp) if closed_order.entry_timestamp else 0
-                pnl_percent = (pnl_usd / (closed_order.entry_price * closed_order.quantity * 100.0)) * 100.0 if closed_order.entry_price > 0 else 0.0
+
                 log_position_closed(
                     symbol=closed_order.symbol,
                     side=closed_order.side,
@@ -229,21 +295,18 @@ class ExecutionOMSAgent:
                     order_id=order_id,
                     duration_sec=duration_sec
                 )
-                logger.info(f"📉 Posición cerrada #{ticket_int} {closed_order.symbol} | PnL: ${pnl_usd:.2f} | Razón: {close_reason}")
+                logger.info(
+                    f"📉 Posición cerrada #{ticket_int} {closed_order.symbol} | "
+                    f"PnL: ${pnl_usd:.2f} | Razón: {close_reason}"
+                )
 
     def _update_mt5_sl(self, ticket_id: str, symbol: str, new_sl: float, current_tp: float):
-        """
-        🔧 v1.2: Valida SL contra el precio actual antes de enviar.
-        Auto-ajusta si es necesario para respetar stops_level.
-        Warning solo 1 vez por ticket.
-        """
         if not ticket_id.isdigit():
             return
 
         try:
             ticket = int(ticket_id)
 
-            # 🔧 Validar contra el precio actual de la posición
             positions = mt5.positions_get(ticket=ticket)
             if not positions:
                 return
@@ -255,7 +318,6 @@ class ExecutionOMSAgent:
             if not tick or not info:
                 return
 
-            # Distancia mínima permitida (stops_level o colchón)
             stops_level = (
                 getattr(info, "stops_level", None)
                 or getattr(info, "trade_stops_level", None)
@@ -263,9 +325,7 @@ class ExecutionOMSAgent:
             )
             min_distance = max(stops_level * info.point, info.point * 50)
 
-            # Validar coherencia: SL debe estar al lado correcto del precio
             if pos.type == mt5.ORDER_TYPE_BUY:
-                # BUY: SL debe estar por DEBAJO del bid actual
                 if new_sl >= tick.bid - min_distance:
                     adjusted_sl = round(tick.bid - min_distance, info.digits)
                     logger.debug(
@@ -274,7 +334,6 @@ class ExecutionOMSAgent:
                     )
                     new_sl = adjusted_sl
             else:
-                # SELL: SL debe estar por ENCIMA del ask actual
                 if new_sl <= tick.ask + min_distance:
                     adjusted_sl = round(tick.ask + min_distance, info.digits)
                     logger.debug(
@@ -294,7 +353,6 @@ class ExecutionOMSAgent:
 
             if not (res and res.retcode == mt5.TRADE_RETCODE_DONE):
                 comment = res.comment if res else "Error de envío"
-                # 🔧 Solo mostrar warning 1 vez por ticket
                 if ticket not in self._sl_warning_shown:
                     logger.warning(f"⚠️ No se pudo modificar SL (Ticket #{ticket}): {comment}")
                     self._sl_warning_shown.add(ticket)
@@ -357,7 +415,6 @@ class ExecutionOMSAgent:
             return None
 
         if order.side == "BUY":
-            # Break-Even
             if not order.break_even_activated and current_price >= order.entry_price + (atr * self.be_trigger_atr):
                 old_sl = order.stop_loss
                 be_price = round(order.entry_price + (atr * self.be_lock_atr), 2)
@@ -375,7 +432,6 @@ class ExecutionOMSAgent:
                         order_id=order_id
                     )
 
-            # Trailing Stop
             if not order.trailing_stop_active and current_price >= order.entry_price + (atr * self.trail_trigger_atr):
                 order.trailing_stop_active = True
                 order.trailing_stop_price = round(current_price - (atr * self.trail_dist_atr), 2)
@@ -404,7 +460,6 @@ class ExecutionOMSAgent:
                     )
 
         elif order.side == "SELL":
-            # Break-Even
             if not order.break_even_activated and current_price <= order.entry_price - (atr * self.be_trigger_atr):
                 old_sl = order.stop_loss
                 be_price = round(order.entry_price - (atr * self.be_lock_atr), 2)
@@ -422,7 +477,6 @@ class ExecutionOMSAgent:
                         order_id=order_id
                     )
 
-            # Trailing Stop
             if not order.trailing_stop_active and current_price <= order.entry_price - (atr * self.trail_trigger_atr):
                 order.trailing_stop_active = True
                 order.trailing_stop_price = round(current_price + (atr * self.trail_dist_atr), 2)

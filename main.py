@@ -2,12 +2,13 @@
 =============================================================================
 QUANTEDGE AI — MOTOR AUTÓNOMO DE TRADING INSTITUCIONAL MULTI-ACTIVO (UTC+3)
 =============================================================================
-🔧 v1.7.0:
+🔧 v1.7.1:
   • FIX #1 activo (vía risk_guardian + execution_agent → OIL unificado).
   • FIX #2 activo (vía signal_agent → filtro M15).
-  • Logger y TZ_MT5 movidos al inicio (fix NameError en write_daily_report_state).
-  • DECISION_THROTTLE_SECONDS subido a 1.0s (menos carga IPC).
-  • Añadido soporte para XAGUSD (Plata) y US500 (S&P 500).
+  • 🐛 BUG #1 CORREGIDO: is_buyer_maker ahora se infiere con tick rule
+    (bid/ask/mid) en lugar de la comparación errónea last < ask.
+  • DECISION_THROTTLE_SECONDS = 1.0s (menos carga IPC).
+  • Soporte para XAGUSD (Plata) y US500 (S&P 500).
   • Cooldown de 5 min tras "Invalid stops".
   • Cooldown de 30 min tras "Market closed".
   • Capital leído dinámicamente desde MT5.
@@ -483,6 +484,49 @@ def close_all_positions() -> int:
 
 
 # =============================================================================
+# 🐛 BUG #1 CORREGIDO — inferencia de agresor (is_buyer_maker) vía tick rule
+# =============================================================================
+def infer_is_buyer_maker(tick_info) -> bool:
+    """
+    🐛 BUG #1 CORREGIDO.
+
+    En Binance, is_buyer_maker viene explícito en el payload del trade.
+    En MT5 NO existe: hay que inferirlo.
+
+    Regla de Lee-Ready simplificada (tick rule):
+      • last >= ask  → comprador agresivo  → is_buyer_maker = False
+      • last <= bid  → vendedor agresivo   → is_buyer_maker = True
+      • bid < last < ask → fallback por mid-price:
+            last >= mid → False (comprador)
+            last <  mid → True  (vendedor)
+
+    Returns:
+        True  → el agresor fue el vendedor (sell aggressor)
+        False → el agresor fue el comprador (buy aggressor)
+    """
+    try:
+        bid = float(getattr(tick_info, "bid", 0.0) or 0.0)
+        ask = float(getattr(tick_info, "ask", 0.0) or 0.0)
+        last = float(getattr(tick_info, "last", 0.0) or 0.0)
+    except Exception:
+        return False
+
+    # Sin last válido → neutro (no contamina demasiado el CVD)
+    if last <= 0 or bid <= 0 or ask <= 0:
+        return False
+
+    # Si el last está fuera del spread → regla directa
+    if last >= ask:
+        return False  # comprador agresivo
+    if last <= bid:
+        return True   # vendedor agresivo
+
+    # Dentro del spread → fallback por mid-price
+    mid = (bid + ask) / 2.0
+    return last < mid
+
+
+# =============================================================================
 # CONFIGURACIÓN
 # =============================================================================
 MT5_ACCOUNT = int(os.getenv("MT5_ACCOUNT", "52974519"))
@@ -493,7 +537,6 @@ DEFAULT_SYMBOLS = "XAUUSD,WTI,BRENT,EURUSD,GBPUSD,BTCUSD,ETHUSD,SOLUSD"
 TRADING_SYMBOLS_RAW = os.getenv("TRADING_SYMBOLS", DEFAULT_SYMBOLS)
 SYMBOLS_LIST = [s.strip() for s in TRADING_SYMBOLS_RAW.split(",") if s.strip()]
 
-# 🔧 FIX: subir throttle a 1.0s (menos carga IPC)
 DECISION_THROTTLE_SECONDS = float(os.getenv("DECISION_THROTTLE_SECONDS", "1.0"))
 HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "900.0"))
 FAILED_ORDER_COOLDOWN_SEC = float(os.getenv("FAILED_ORDER_COOLDOWN_SEC", "300.0"))
@@ -577,7 +620,6 @@ async def main():
 
     has_mt5 = connect_mt5()
 
-    # 🔧 Capital se lee EN VIVO desde MT5
     capital_base = None
     if has_mt5:
         acc = mt5.account_info()
@@ -716,7 +758,8 @@ async def main():
                     spread = tick_info.ask - tick_info.bid
                     spread_bps = (spread / price) * 10000.0 if price > 0 else 0.0
 
-                    is_buyer_maker = tick_info.last < tick_info.ask if tick_info.last > 0 else False
+                    # 🐛 BUG #1 CORREGIDO: usar tick rule (bid/ask/mid) en lugar de last < ask
+                    is_buyer_maker = infer_is_buyer_maker(tick_info)
                     qty = float(tick_info.volume_real) if hasattr(tick_info, 'volume_real') and tick_info.volume_real > 0 else 1.0
 
                     tick_obj = Tick(
