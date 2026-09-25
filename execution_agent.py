@@ -1,12 +1,13 @@
 """
 MÓDULO DE EJECUCIÓN INSTITUCIONAL Y OMS (AGENTE 4)
 
-🔧 v1.4:
-  • 🐛 BUG #4 CORREGIDO: pnl_percent ahora usa contract_size real del símbolo
-    (antes usaba un *100 fijo incorrecto).
+🔧 v1.5:
+  • 🐛 BUG #1 de hora CORREGIDO: `duration_sec` ya no es negativo.
+    Ahora usa `time_utils.mt5_ms_to_epoch()` para convertir `p.time_msc`
+    de MT5 (UTC+3 "disfrazado" de UTC) a epoch UTC real.
+  • 🐛 BUG #4 CORREGIDO: pnl_percent usa contract_size real del símbolo.
   • 🐛 BUG #5 CORREGIDO: cuando no se encuentran deals para un ticket,
-    se marca como "UNKNOWN" en lugar de "MANUAL_CLOSE" silencioso,
-    y se loguea warning para diagnóstico.
+    se marca como "UNKNOWN" en lugar de "MANUAL_CLOSE" silencioso.
   • FIX #1: WTI y BRENT unificados como "OIL" en get_canonical_asset().
   • Soporte para XAG (Plata) y US500 (S&P 500) en canónico.
   • _update_mt5_sl valida SL contra el precio actual antes de enviar.
@@ -33,6 +34,7 @@ from audit_logger import (
     log_position_closed,
     log_audit_event
 )
+from time_utils import mt5_ms_to_epoch
 
 load_dotenv()
 logger = logging.getLogger("ExecutionOMS")
@@ -141,15 +143,12 @@ class ExecutionOMSAgent:
         return 1.0
 
     @staticmethod
-    def _fetch_realized_pnl_from_mt5(ticket: int) -> tuple[float, float, str]:
+    def _fetch_realized_pnl_from_mt5(ticket: int, max_retries: int = 3, retry_delay: float = 0.5) -> tuple[float, float, str]:
         """
         Obtiene el PnL real de un ticket cerrado desde el historial de MT5.
 
-        🐛 BUG #5 CORREGIDO:
-          - Si no se encuentran deals para el ticket → reason="UNKNOWN"
-            (antes se ponía "MANUAL_CLOSE" en silencio, lo que contaminaba el learner).
-          - Se loguea warning cuando no se encuentran deals.
-          - Se separa el caso "ticket encontrado pero sin deals" del "MT5 sin historial".
+        🐛 BUG #6 CORREGIDO: MT5 puede tardar en reflejar deals recién cerrados.
+        Se añaden reintentos con backoff para dar tiempo al historial.
         """
         try:
             from datetime import datetime, timedelta, timezone as _tz
@@ -157,23 +156,33 @@ class ExecutionOMSAgent:
             from_date = datetime.now(tz_mt5) - timedelta(days=7)
             to_date = datetime.now(tz_mt5) + timedelta(days=1)
 
-            deals = mt5.history_deals_get(from_date, to_date, position=ticket)
-            used_filtered = deals is not None and len(deals) > 0
+            deals = None
+            for attempt in range(max_retries):
+                # Intento 1: pedir deals específicos del position_id
+                deals = mt5.history_deals_get(from_date, to_date, position=ticket)
 
-            if not used_filtered:
-                # Fallback: pedir todo y filtrar en Python
-                all_deals = mt5.history_deals_get(from_date, to_date)
-                if all_deals:
-                    deals = [d for d in all_deals
-                             if (getattr(d, "position_id", None) or getattr(d, "position", None)) == ticket]
-                else:
-                    deals = None
+                if not deals or len(deals) == 0:
+                    # Intento 2: fallback, pedir todos y filtrar
+                    all_deals = mt5.history_deals_get(from_date, to_date)
+                    if all_deals:
+                        deals = [d for d in all_deals
+                                 if (getattr(d, "position_id", None) or getattr(d, "position", None)) == ticket]
+
+                if deals and len(deals) > 0:
+                    break  # Encontrado, salir del bucle
+
+                if attempt < max_retries - 1:
+                    logger.debug(
+                        f"⏳ Reintentando fetch de deals para ticket #{ticket} "
+                        f"(intento {attempt+1}/{max_retries}, esperando {retry_delay:.1f}s)"
+                    )
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Backoff exponencial
 
             if not deals:
-                # 🐛 BUG #5: no inventar "MANUAL_CLOSE", marcar como UNKNOWN
                 logger.warning(
-                    f"⚠️ No se encontraron deals en MT5 para el ticket #{ticket}. "
-                    f"PnL se registrará como 0.0 con reason=UNKNOWN."
+                    f"⚠️ No se encontraron deals en MT5 para el ticket #{ticket} "
+                    f"tras {max_retries} intentos. PnL se registrará como 0.0 con reason=UNKNOWN."
                 )
                 return 0.0, 0.0, "UNKNOWN"
 
@@ -206,8 +215,6 @@ class ExecutionOMSAgent:
 
             total_pnl = total_profit + total_commission + total_swap
 
-            # Si no se identificó razón clara, dejarlo como MANUAL_CLOSE
-            # solo si encontramos al menos un DEAL_ENTRY_OUT para este ticket
             if reason == "UNKNOWN" and close_price > 0:
                 reason = "MANUAL_CLOSE"
 
@@ -227,7 +234,11 @@ class ExecutionOMSAgent:
             side = "BUY" if p.type == mt5.ORDER_TYPE_BUY else "SELL"
 
             if order_key not in self.active_orders:
-                entry_time = (p.time_msc / 1000.0) if hasattr(p, 'time_msc') and p.time_msc else time.time()
+                # 🐛 BUG #1 de hora CORREGIDO:
+                # p.time_msc viene en hora MT5 (UTC+3) "disfrazada" de UTC.
+                # mt5_ms_to_epoch() lo convierte a epoch UTC real.
+                entry_time = mt5_ms_to_epoch(p.time_msc) if hasattr(p, 'time_msc') and p.time_msc else time.time()
+
                 order = BracketOrder(
                     order_id=order_key,
                     symbol=p.symbol,
@@ -280,6 +291,9 @@ class ExecutionOMSAgent:
                 notional = closed_order.entry_price * closed_order.quantity * contract_size
                 pnl_percent = (pnl_usd / notional) * 100.0 if notional > 0 else 0.0
 
+                # 🐛 BUG #1 de hora CORREGIDO:
+                # entry_timestamp ya es epoch UTC real, así que time.time() - entry_timestamp
+                # da una duración correcta (positiva).
                 duration_sec = int(time.time() - closed_order.entry_timestamp) if closed_order.entry_timestamp else 0
 
                 log_position_closed(
@@ -297,7 +311,7 @@ class ExecutionOMSAgent:
                 )
                 logger.info(
                     f"📉 Posición cerrada #{ticket_int} {closed_order.symbol} | "
-                    f"PnL: ${pnl_usd:.2f} | Razón: {close_reason}"
+                    f"PnL: ${pnl_usd:.2f} | Razón: {close_reason} | Duración: {duration_sec}s"
                 )
 
     def _update_mt5_sl(self, ticket_id: str, symbol: str, new_sl: float, current_tp: float):

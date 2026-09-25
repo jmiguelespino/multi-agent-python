@@ -1,14 +1,14 @@
 """
 MÓDULO DE ESTRATEGIA CUANTITATIVA Y GENERACIÓN DE SEÑALES SNIPER (AGENTE 2)
 
-🔧 v1.6:
-  • 🐛 BUG #3 CORREGIDO: _check_macro_trend ahora resuelve el símbolo real
-    en MT5 (con sufijo .raw, etc.) antes de pedir las velas M15.
-  • Añadidos logs debug cuando el filtro M15 rechaza una señal.
-  • EMA20 inicializada con SMA(5) para reducir el sesgo de arranque.
-  • Soporte para XAGUSD (Plata) y US500 (S&P 500).
-  • Precisión decimal correcta por clase de activo.
-  • FIX #2: Filtro de tendencia macro M15 (EMA20).
+🔧 v1.7.1:
+  • 🆕 SIGNAL_REJECTED: cuando evaluate() devuelve None por RSI/tendencia,
+    se loguea con rate limiter de 5 min por símbolo (logger.debug).
+  • WARMUP: `evaluate()` rechaza señales si `f.is_ready == False`.
+  • BUG #3 CORREGIDO: _check_macro_trend resuelve el símbolo real en MT5.
+  • Logs debug cuando el filtro M15 rechaza una señal.
+  • EMA20 inicializada con SMA(5).
+  • Soporte para XAGUSD y US500.
 """
 import os
 import time
@@ -21,6 +21,10 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger("SignalAgent")
 logger.propagate = False
+
+
+# 🆕 v1.7.1: rate limiter para logs de rechazo
+_REJECTION_LOG_COOLDOWN_SEC = 300.0
 
 
 class SignalType(str, Enum):
@@ -70,7 +74,6 @@ class StrategySignalAgent:
         "FOREX": 5,
     }
 
-    # Mapeo de alias para resolver el símbolo real en MT5
     _MT5_SYMBOL_ALIASES = {
         "XAUUSD": ["XAUUSD", "GOLD", "XAUUSD.raw", "GOLD.raw"],
         "XAGUSD": ["XAGUSD", "SILVER", "XAGUSD.raw", "SILVER.raw"],
@@ -91,7 +94,7 @@ class StrategySignalAgent:
         atr_profit_multiplier: Optional[float] = None
     ):
         self.symbol = symbol
-        self.min_confidence = min_confidence_threshold or float(os.getenv("MIN_CONFIDENCE_THRESHOLD", "86.0"))
+        self.min_confidence = min_confidence_threshold or float(os.getenv("MIN_CONFIDENCE_THRESHOLD", "90.0"))
 
         sym_upper = symbol.upper()
         self.is_gold = any(k in sym_upper for k in ["XAU", "GOLD"])
@@ -102,9 +105,11 @@ class StrategySignalAgent:
         self.is_index = any(idx in sym_upper for idx in ["US500", "SP500", "SPX", "NAS100", "US30", "GER40", "UK100"])
 
         self.precision = self._get_precision()
-
-        # Cache del símbolo resuelto para MT5 (evita resolver en cada tick)
         self._resolved_mt5_symbol: Optional[str] = None
+
+        # 🆕 v1.7.1: rate limiter de logs de rechazo
+        self._last_rejection_log_ts: float = 0.0
+        self._last_rejection_reason: str = ""
 
         if self.is_gold:
             default_sl = float(os.getenv("GOLD_ATR_STOP_MULTIPLIER", "4.5"))
@@ -154,12 +159,6 @@ class StrategySignalAgent:
         return 2
 
     def _resolve_mt5_symbol(self) -> str:
-        """
-        🐛 BUG #3 CORREGIDO.
-        Resuelve el símbolo lógico al símbolo real de MT5.
-        Por ejemplo: "WTI" → "XTIUSD.raw".
-        Cachea el resultado en self._resolved_mt5_symbol.
-        """
         if self._resolved_mt5_symbol:
             return self._resolved_mt5_symbol
 
@@ -167,24 +166,24 @@ class StrategySignalAgent:
             import MetaTrader5 as mt5
             sym_upper = self.symbol.upper()
 
-            # Primero probar el símbolo tal cual
             if mt5.symbol_info(self.symbol):
                 self._resolved_mt5_symbol = self.symbol
                 return self._resolved_mt5_symbol
 
-            # Probar aliases por clase
             aliases = self._MT5_SYMBOL_ALIASES.get(sym_upper, [])
             if not aliases:
-                # Fallback genérico
                 aliases = [f"{self.symbol}.raw", f"{self.symbol}_raw", f"{self.symbol}m"]
 
             for alias in aliases:
                 if mt5.symbol_info(alias):
+                    try:
+                        mt5.symbol_select(alias, True)
+                    except Exception:
+                        pass
                     self._resolved_mt5_symbol = alias
                     logger.info(f"🔧 [M15] Símbolo '{self.symbol}' resuelto a '{alias}' en MT5")
                     return alias
 
-            # No se encontró → usar el original (el filtro será fail-safe)
             logger.warning(f"⚠️ [M15] No se pudo resolver símbolo '{self.symbol}' en MT5. Filtro M15 será fail-safe.")
             self._resolved_mt5_symbol = self.symbol
             return self._resolved_mt5_symbol
@@ -193,31 +192,22 @@ class StrategySignalAgent:
             return self.symbol
 
     def _check_macro_trend(self, signal_type_str: str, current_price: float) -> bool:
-        """
-        🔧 FIX #2: Verifica que la tendencia de 15min esté alineada con la señal.
-        Retorna True si está alineada, False si no.
-
-        🐛 BUG #3 CORREGIDO: resuelve el símbolo real en MT5 antes de pedir las velas.
-        """
         try:
             import MetaTrader5 as mt5
             resolved_sym = self._resolve_mt5_symbol()
 
             rates = mt5.copy_rates_from_pos(resolved_sym, mt5.TIMEFRAME_M15, 0, 30)
             if rates is None or len(rates) < 20:
-                return True  # Sin datos suficientes → permitir
+                return True
 
-            # Calcular EMA 20 en M15 (inicialización con SMA de los primeros 5)
             closes = [r['close'] for r in rates[-20:]]
             k = 2.0 / (20 + 1)
 
-            # SMA inicial más robusta para los primeros 5 cierres
             seed_len = min(5, len(closes))
             ema20 = sum(closes[:seed_len]) / seed_len
             for c in closes[seed_len:]:
                 ema20 = c * k + ema20 * (1 - k)
 
-            # BUY solo si precio > EMA20_M15
             if signal_type_str == "BUY" and current_price < ema20:
                 logger.debug(
                     f"🔍 [M15] BUY RECHAZADO en {self.symbol} ({resolved_sym}): "
@@ -225,7 +215,6 @@ class StrategySignalAgent:
                 )
                 return False
 
-            # SELL solo si precio < EMA20_M15
             if signal_type_str == "SELL" and current_price > ema20:
                 logger.debug(
                     f"🔍 [M15] SELL RECHAZADO en {self.symbol} ({resolved_sym}): "
@@ -238,7 +227,24 @@ class StrategySignalAgent:
             logger.debug(f"🔍 [M15] Fail-safe para {self.symbol}: {e}")
             return True
 
+    # 🆕 v1.7.1: log de rechazo con rate limiter
+    def _log_rejection(self, reason: str, rsi: float, trend_score: float, momentum_score: float):
+        """Loguea el rechazo con rate limiter de 5 min por símbolo."""
+        now = time.time()
+        if now - self._last_rejection_log_ts < _REJECTION_LOG_COOLDOWN_SEC:
+            return
+        self._last_rejection_log_ts = now
+        self._last_rejection_reason = reason
+        logger.debug(
+            f"⏸️  [REJECT] {self.symbol}: {reason} | RSI={rsi:.1f} | "
+            f"trend={trend_score:+.0f} | momentum={momentum_score:+.0f}"
+        )
+
     def evaluate(self, f) -> Optional[TradeSignal]:
+        # WARMUP: no generar señales si no hay datos suficientes
+        if not getattr(f, "is_ready", False):
+            return None
+
         reasons: List[str] = []
         trend_score = 0.0
         momentum_score = 0.0
@@ -320,12 +326,20 @@ class StrategySignalAgent:
             signal_type = SignalType.SELL
             confidence = round(bear_conf * 100, 1)
         else:
+            # 🆕 v1.7.1: log de rechazo con rate limiter
+            if momentum_score == 0.0:
+                self._log_rejection("RSI fuera de zona", f.rsi14, trend_score, momentum_score)
+            elif trend_score == 0.0:
+                self._log_rejection("Sin tendencia clara", f.rsi14, trend_score, momentum_score)
+            else:
+                self._log_rejection(f"Confianza insuficiente ({max(bull_conf, bear_conf)*100:.1f}%)",
+                                    f.rsi14, trend_score, momentum_score)
             return None
 
-        # 🔧 FIX #2: Verificar tendencia macro M15 antes de aceptar la señal
+        # FIX #2: Verificar tendencia macro M15
         signal_type_str = signal_type.value if hasattr(signal_type, 'value') else str(signal_type)
         if not self._check_macro_trend(signal_type_str, f.price):
-            return None  # Rechazar señal contraria a tendencia macro
+            return None
 
         sl_distance = f.atr14 * self.atr_stop_multiplier
         tp_distance = f.atr14 * self.atr_profit_multiplier

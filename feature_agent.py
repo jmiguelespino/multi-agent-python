@@ -1,9 +1,14 @@
 """
 AGENTE 1: INGESTION & FEATURE ENGINEERING AGENT
 
-🔧 v1.3.2:
-  • 🐛 MEJORA #5: añadidos MIN_ATR para XAG (Plata) y US500 (S&P 500).
-  • ATR mínimo forzado por clase de activo (evita ATR=0 que rompe stops).
+🔧 v1.4.1:
+  • 🐛 MIN_ATR recalibrados para el mercado actual.
+    Antes: BTC=50, ETH=3.0, SOL=0.10 (demasiado altos, forzaban SL/TP
+    desproporcionados en cripto cuando el ATR real era menor).
+    Ahora: BTC=20, ETH=1.0, SOL=0.03.
+  • 🆕 WARMUP: el FeatureVector expone `is_ready` que solo es True cuando
+    hay ≥20 velas cerradas y el ATR14 está calculado con Wilder real.
+  • 🐛 MEJORA #5: MIN_ATR para XAG (Plata) y US500 (S&P 500).
   • VWAP O(1) + ATR Wilder.
 """
 import math
@@ -11,6 +16,12 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 from data_streamer import Tick
+
+
+# =============================================================================
+# CONSTANTE DE WARMUP
+# =============================================================================
+MIN_CANDLES_FOR_READY = 20
 
 
 @dataclass(slots=True)
@@ -42,20 +53,23 @@ class FeatureVector:
     atr14: float
     cvd: float
     candle_delta: float
+    # 🆕 v1.4.0: flag de warmup
+    is_ready: bool = False
+    candles_closed: int = 0
 
 
 class IngestionFeatureAgent:
-    # 🔧 ATR mínimo por clase de activo (protege contra ATR=0)
+    # 🐛 v1.4.1: MIN_ATR recalibrados
     MIN_ATR_BY_CLASS = {
-        "XAU": 0.50,      # Oro: mínimo $0.50
-        "XAG": 0.02,      # 🐛 MEJORA #5: Plata: mínimo $0.02
-        "WTI": 0.05,      # Petróleo: mínimo $0.05
+        "XAU": 0.50,       # Oro: $0.50
+        "XAG": 0.02,       # Plata: $0.02
+        "WTI": 0.05,       # Petróleo: $0.05
         "BRENT": 0.05,
-        "BTC": 50.0,      # BTC: mínimo $50
-        "ETH": 3.0,       # ETH: mínimo $3
-        "SOL": 0.10,      # SOL: mínimo $0.10
-        "US500": 0.50,    # 🐛 MEJORA #5: S&P 500: mínimo 0.50 puntos
-        "FOREX": 0.00015, # Forex: mínimo 1.5 pips
+        "BTC": 20.0,       # 🆕 BTC: $20 (antes 50)
+        "ETH": 1.0,        # 🆕 ETH: $1 (antes 3)
+        "SOL": 0.03,       # 🆕 SOL: $0.03 (antes 0.10)
+        "US500": 0.50,     # S&P 500: 0.50 puntos
+        "FOREX": 0.00015,  # Forex: 1.5 pips
     }
 
     def __init__(self, symbol: str = "XAUUSD", candle_period_ms: int = 60000, history_length: int = 200):
@@ -82,15 +96,32 @@ class IngestionFeatureAgent:
         self._vwap_stdev: float = 0.0
 
         self.last_feature_vector: Optional[FeatureVector] = None
+        self.candles_closed_count: int = 0
 
     # -------------------------------------------------------------------------
-    # 🔧 ATR mínimo según clase de activo
+    # WARMUP
+    # -------------------------------------------------------------------------
+    def is_ready(self) -> bool:
+        """
+        Indica si el agente tiene datos suficientes para generar señales fiables.
+        Requiere:
+          • ≥20 velas cerradas (MIN_CANDLES_FOR_READY).
+          • ATR14 calculado con Wilder real (self.atr14 is not None).
+        """
+        return (
+            self.candles_closed_count >= MIN_CANDLES_FOR_READY
+            and self.atr14 is not None
+            and self.atr14 > 0
+        )
+
+    # -------------------------------------------------------------------------
+    # ATR mínimo según clase de activo
     # -------------------------------------------------------------------------
     def _get_min_atr(self) -> float:
         s = self.symbol.upper()
         if "XAU" in s or "GOLD" in s:
             return self.MIN_ATR_BY_CLASS["XAU"]
-        if "XAG" in s or "SILVER" in s:  # 🐛 MEJORA #5
+        if "XAG" in s or "SILVER" in s:
             return self.MIN_ATR_BY_CLASS["XAG"]
         if "WTI" in s or "XTI" in s or "OIL" in s:
             return self.MIN_ATR_BY_CLASS["WTI"]
@@ -102,7 +133,7 @@ class IngestionFeatureAgent:
             return self.MIN_ATR_BY_CLASS["ETH"]
         if "SOL" in s:
             return self.MIN_ATR_BY_CLASS["SOL"]
-        if "US500" in s or "SP500" in s or "SPX" in s:  # 🐛 MEJORA #5
+        if "US500" in s or "SP500" in s or "SPX" in s:
             return self.MIN_ATR_BY_CLASS["US500"]
         if any(fx in s for fx in ["EUR", "GBP", "JPY", "AUD", "NZD"]):
             return self.MIN_ATR_BY_CLASS["FOREX"]
@@ -161,10 +192,12 @@ class IngestionFeatureAgent:
             self._add_candle_to_vwap_accumulators(self.current_candle)
 
         elif candle_open_time > self.current_candle.timestamp_ms:
+            # Cerrar vela anterior
             self.current_candle.closed = True
             self.candles.append(self.current_candle)
             self._update_atr_on_candle_close(self.current_candle)
             self._rebuild_vwap_accumulators()
+            self.candles_closed_count += 1
 
             self.current_candle = Candle(
                 timestamp_ms=candle_open_time,
@@ -197,6 +230,7 @@ class IngestionFeatureAgent:
         atr = max(atr_raw, self._get_min_atr())
 
         candle_delta = self.current_candle.buy_volume - self.current_candle.sell_volume
+        ready = self.is_ready()
 
         feat = FeatureVector(
             timestamp_ms=tick.timestamp_ms,
@@ -211,7 +245,9 @@ class IngestionFeatureAgent:
             rsi14=rsi,
             atr14=atr,
             cvd=self.cvd,
-            candle_delta=candle_delta
+            candle_delta=candle_delta,
+            is_ready=ready,
+            candles_closed=self.candles_closed_count,
         )
         self.last_feature_vector = feat
         return feat
@@ -237,19 +273,19 @@ class IngestionFeatureAgent:
         s = self.symbol.upper()
         if "XAU" in s or "GOLD" in s:
             return 2.50
-        if "XAG" in s or "SILVER" in s:  # 🐛 MEJORA #5: default para plata
+        if "XAG" in s or "SILVER" in s:
             return 0.05
         if "BTC" in s:
-            return 150.0
+            return 500.0     # 🆕 antes 150, más realista
         if "ETH" in s:
-            return 10.0
+            return 15.0      # 🆕 antes 10
         if "SOL" in s:
-            return 0.50
+            return 0.30      # 🆕 antes 0.50
         if "WTI" in s or "XTI" in s:
             return 0.30
         if "BRENT" in s or "XBR" in s:
             return 0.30
-        if "US500" in s or "SP500" in s:  # 🐛 MEJORA #5: default para índice
+        if "US500" in s or "SP500" in s:
             return 5.0
         if any(fx in s for fx in ["EUR", "GBP"]):
             return 0.0015

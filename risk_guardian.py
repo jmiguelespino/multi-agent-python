@@ -2,11 +2,16 @@
 =============================================================================
 QUANTEDGE AI — MÓDULO DE GESTIÓN DE RIESGO INSTITUCIONAL Y CIRCUIT BREAKERS
 =============================================================================
-🔧 v1.7:
-  • FIX: WTI y BRENT unificados como "OIL" (evita doble exposición a petróleo).
-  • Añadido soporte para XAGUSD (Plata) y US500 (S&P 500).
-  • CRYPTO_MAX_RISK_PCT ahora se aplica correctamente antes del sizing.
-  • Acepta volume_min del broker si el riesgo resultante es <= 3x el límite.
+🔧 v1.7.1:
+  • 🐛 SIZING CORREGIDO: contract_size se obtiene de MT5 si está disponible.
+    Antes se usaba un fallback con multiplicadores `*100` que sobreestimaba
+    el riesgo en cripto y forzaba caps artificiales.
+  • 🐛 CAPS por clase revisados:
+      CRYPTO_MAX_LOT_SIZE default 0.10 (antes 1.0 en .env del usuario).
+      US500_MAX_LOT_SIZE default 0.50 (antes 1.0).
+  • FIX: WTI y BRENT unificados como "OIL".
+  • Soporte para XAGUSD y US500.
+  • CRYPTO_MAX_RISK_PCT se aplica antes del sizing.
   • Bloqueo PERMANENTE solo si el volume_min implica riesgo excesivo.
   • Rate limiter para logs de spread (60s por símbolo).
   • Lock con TTL.
@@ -45,9 +50,7 @@ def is_us_market_hours() -> bool:
 
 
 def get_canonical_asset(symbol: str) -> str:
-    """
-    🔧 v1.7: WTI y BRENT devuelven "OIL" para unificar exposición.
-    """
+    """WTI y BRENT devuelven "OIL" para unificar exposición."""
     if not symbol:
         return ""
     s = symbol.upper().replace(".RAW", "").replace("_RAW", "").strip()
@@ -61,7 +64,6 @@ def get_canonical_asset(symbol: str) -> str:
         return "XAU"
     if "XAG" in s or "SILVER" in s or "PLATA" in s:
         return "XAG"
-    # 🔧 FIX: WTI y BRENT → "OIL" (mismo activo subyacente)
     if "WTI" in s or "XTI" in s or "USO" in s or "CRUDE" in s or "OIL" in s or "PETROLEO" in s:
         return "OIL"
     if "BRENT" in s or "XBR" in s or "UKO" in s:
@@ -73,6 +75,58 @@ def get_canonical_asset(symbol: str) -> str:
     if "GBP" in s:
         return "GBPUSD"
     return s
+
+
+def get_contract_size(symbol: str, canonical: str) -> float:
+    """
+    🐛 v1.7.1: obtiene el contract_size REAL del broker.
+    Si MT5 no responde, usa fallbacks por clase.
+    """
+    try:
+        info = mt5.symbol_info(symbol)
+        if info and getattr(info, "trade_contract_size", 0) > 0:
+            return float(info.trade_contract_size)
+    except Exception:
+        pass
+
+    # Fallbacks por clase
+    if canonical == "XAU":
+        return 100.0
+    if canonical == "XAG":
+        return 1000.0
+    if canonical in ("BTC", "ETH", "SOL"):
+        return 1.0
+    if canonical == "OIL":
+        return 100.0
+    if canonical == "US500":
+        return 1.0
+    if canonical in ("EURUSD", "GBPUSD"):
+        return 100000.0
+    return 1.0
+
+
+def get_max_lot(canonical: str) -> float:
+    """Caps por clase de activo."""
+    if canonical == "XAU":
+        return float(os.getenv("GOLD_MAX_LOT_SIZE", "0.02"))
+    if canonical == "XAG":
+        return float(os.getenv("XAG_MAX_LOT_SIZE", "0.05"))
+    if canonical == "OIL":
+        return float(os.getenv("CRUDE_MAX_LOT_SIZE", "0.50"))
+    if canonical == "US500":
+        return float(os.getenv("US500_MAX_LOT_SIZE", "0.50"))
+    if canonical in ("BTC", "ETH", "SOL"):
+        return float(os.getenv("CRYPTO_MAX_LOT_SIZE", "0.10"))
+    return float(os.getenv("FOREX_MAX_LOT_SIZE", "0.10"))
+
+
+def get_risk_pct(canonical: str) -> float:
+    """Riesgo por trade según clase."""
+    if canonical == "XAU":
+        return float(os.getenv("GOLD_MAX_RISK_PCT", "0.3"))
+    if canonical in ("BTC", "ETH", "SOL"):
+        return float(os.getenv("CRYPTO_MAX_RISK_PCT", "0.5"))
+    return float(os.getenv("MAX_RISK_PER_TRADE_PCT", "0.5"))
 
 
 class InstitutionalRiskGuardian:
@@ -93,10 +147,10 @@ class InstitutionalRiskGuardian:
         self.initial_capital = initial_capital or float(os.getenv("CAPITAL_BASE_USD", "1500.0"))
         self.current_equity = self.initial_capital
         self.daily_peak_equity = self.initial_capital
-        self.max_risk_per_trade_pct = max_risk_per_trade_pct or float(os.getenv("MAX_RISK_PER_TRADE_PCT", "1.0"))
+        self.max_risk_per_trade_pct = max_risk_per_trade_pct or float(os.getenv("MAX_RISK_PER_TRADE_PCT", "0.5"))
         self.daily_drawdown_limit_pct = daily_drawdown_limit_pct or float(os.getenv("DAILY_DRAWDOWN_LIMIT_PCT", "3.0"))
-        self.max_concurrent_positions = max_concurrent_positions or int(os.getenv("MAX_CONCURRENT_POSITIONS", "5"))
-        self.max_daily_trades = max_daily_trades or int(os.getenv("MAX_DAILY_TRADES", "25"))
+        self.max_concurrent_positions = max_concurrent_positions or int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
+        self.max_daily_trades = max_daily_trades or int(os.getenv("MAX_DAILY_TRADES", "20"))
         self.cooldown_seconds = cooldown_seconds or int(os.getenv("COOLDOWN_SECONDS", "60"))
         self.max_allowed_spread_bps = max_allowed_spread_bps or float(os.getenv("MAX_ALLOWED_SPREAD_BPS", "15.0"))
 
@@ -161,7 +215,7 @@ class InstitutionalRiskGuardian:
                 symbol=symbol,
                 reason=msg,
                 event_type="CIRCUIT_BREAKER_TRIGGERED",
-                details=f"Pico: ${self.daily_peak_equity:.2f} | Equity: ${self.current_equity:.2f} | Drawdown: {drawdown_pct:.2f}%",
+                details=f"Pico: ${self.daily_peak_equity:.2f} | Equity: ${self.current_equity:.2f} | DD: {drawdown_pct:.2f}%",
                 side=side,
                 price=price
             )
@@ -172,12 +226,9 @@ class InstitutionalRiskGuardian:
             msg = f"CUOTA DIARIA CUMPLIDA ({self.trades_executed_today}/{self.max_daily_trades} trades)."
             logger.debug(msg)
             log_rejection(
-                symbol=symbol,
-                reason=msg,
-                event_type="QUOTA_REACHED",
+                symbol=symbol, reason=msg, event_type="QUOTA_REACHED",
                 details=f"Trades ejecutados hoy: {self.trades_executed_today}/{self.max_daily_trades}",
-                side=side,
-                price=price
+                side=side, price=price
             )
             return RiskVerdict(False, msg, 0.0, 0.0, 0.0, False)
 
@@ -188,12 +239,9 @@ class InstitutionalRiskGuardian:
             msg = f"COOLDOWN ACTIVO ({remaining}s restantes)."
             logger.debug(msg)
             log_rejection(
-                symbol=symbol,
-                reason=msg,
-                event_type="COOLDOWN_BLOCKED",
+                symbol=symbol, reason=msg, event_type="COOLDOWN_BLOCKED",
                 details=f"Tiempo restante de cooldown: {remaining}s",
-                side=side,
-                price=price
+                side=side, price=price
             )
             return RiskVerdict(False, msg, 0.0, 0.0, 0.0, False)
 
@@ -208,27 +256,21 @@ class InstitutionalRiskGuardian:
             msg = f"RESGUARDO PATRIMONIAL: Pausa de {int(sl_quarantine_sec/60)} min activa en {symbol} ({canonical_sym}) tras Stop Loss."
             logger.debug(msg)
             log_rejection(
-                symbol=symbol,
-                reason=msg,
-                event_type="COOLDOWN_BLOCKED",
+                symbol=symbol, reason=msg, event_type="COOLDOWN_BLOCKED",
                 details=f"Pausa anti-reincidencia activa: {remaining}s restantes.",
-                side=side,
-                price=price
+                side=side, price=price
             )
             return RiskVerdict(False, msg, 0.0, 0.0, 0.0, False)
 
-        # 4. Doble exposición por activo canónico (ahora WTI y BRENT son "OIL")
+        # 4. Doble exposición por activo canónico (WTI y BRENT son "OIL")
         has_same_asset = any(get_canonical_asset(s) == canonical_sym for s in self.active_symbols)
         if has_same_asset:
             msg = f"Ya existe una posición activa en {symbol} ({canonical_sym})."
             logger.debug(msg)
             log_rejection(
-                symbol=symbol,
-                reason=msg,
-                event_type="MAX_POSITIONS_BLOCKED",
+                symbol=symbol, reason=msg, event_type="MAX_POSITIONS_BLOCKED",
                 details=f"Máx 1 posición por activo ({canonical_sym}).",
-                side=side,
-                price=price
+                side=side, price=price
             )
             return RiskVerdict(False, msg, 0.0, 0.0, 0.0, False)
 
@@ -237,12 +279,9 @@ class InstitutionalRiskGuardian:
             msg = f"Límite de posiciones simultáneas alcanzado ({self.active_positions_count}/{self.max_concurrent_positions})."
             logger.debug(msg)
             log_rejection(
-                symbol=symbol,
-                reason=msg,
-                event_type="MAX_POSITIONS_BLOCKED",
+                symbol=symbol, reason=msg, event_type="MAX_POSITIONS_BLOCKED",
                 details=f"Portafolio al límite configurado ({self.max_concurrent_positions}).",
-                side=side,
-                price=price
+                side=side, price=price
             )
             return RiskVerdict(False, msg, 0.0, 0.0, 0.0, False)
 
@@ -262,26 +301,18 @@ class InstitutionalRiskGuardian:
                 self._last_spread_log[canonical_sym] = now_ts
 
             log_rejection(
-                symbol=symbol,
-                reason=msg,
-                event_type="ORDER_REJECTED",
+                symbol=symbol, reason=msg, event_type="ORDER_REJECTED",
                 details=f"Spread actual {current_market_spread_bps:.1f} bps supera el límite dinámico de {max_spread_limit:.1f} bps",
-                side=side,
-                price=price,
+                side=side, price=price,
                 metadata={"spread_bps": current_market_spread_bps, "max_allowed_bps": max_spread_limit}
             )
             return RiskVerdict(False, msg, 0.0, 0.0, 0.0, False)
 
         # 7. Sizing dinámico
-        # 🔧 Calcular risk_pct específico por activo ANTES del sizing
-        risk_pct = self.max_risk_per_trade_pct
-
-        if canonical_sym == "XAU":
-            risk_pct = float(os.getenv("GOLD_MAX_RISK_PCT", "0.3"))
-        elif canonical_sym in ["BTC", "ETH", "SOL"]:
-            risk_pct = float(os.getenv("CRYPTO_MAX_RISK_PCT", "1.0"))
-
+        # 🐛 v1.7.1: usar helpers get_risk_pct y get_contract_size
+        risk_pct = get_risk_pct(canonical_sym)
         risk_usd = self.current_equity * (risk_pct / 100.0)
+
         stop_distance = abs(signal.price - signal.suggested_stop_loss)
 
         if stop_distance <= 0:
@@ -289,43 +320,17 @@ class InstitutionalRiskGuardian:
             log_rejection(symbol=symbol, reason=err_msg, side=side, price=price)
             return RiskVerdict(False, err_msg, 0.0, 0.0, 0.0, False)
 
-        point_multiplier = 1.0
-        sym_upper = symbol.upper()
+        # 🐛 v1.7.1: contract_size real desde MT5
+        contract_size = get_contract_size(symbol, canonical_sym)
 
-        s_info = mt5.symbol_info(symbol) if hasattr(mt5, 'symbol_info') else None
-        if s_info and hasattr(s_info, 'trade_contract_size') and s_info.trade_contract_size > 0:
-            point_multiplier = float(s_info.trade_contract_size)
-        else:
-            if "XAU" in sym_upper or "GOLD" in sym_upper or "XAG" in sym_upper or "SILVER" in sym_upper:
-                point_multiplier = 100.0 if "XAU" in sym_upper or "GOLD" in sym_upper else 1000.0
-            elif "WTI" in sym_upper or "BRENT" in sym_upper or "OIL" in sym_upper or "XTI" in sym_upper or "XBR" in sym_upper:
-                point_multiplier = 100.0
-            elif any(fx in sym_upper for fx in ["EUR", "GBP", "AUD", "NZD", "USDJPY"]):
-                point_multiplier = 100000.0
-            elif "US500" in sym_upper or "SP500" in sym_upper:
-                point_multiplier = 1.0
-            else:
-                point_multiplier = 1.0
+        calculated_size = round(risk_usd / (stop_distance * contract_size), 2)
 
-        calculated_size = round(risk_usd / (stop_distance * point_multiplier), 2)
-
-        # 🔧 Tope por clase de activo (WTI y BRENT ahora usan "OIL")
-        if canonical_sym == "XAU":
-            max_lot = float(os.getenv("GOLD_MAX_LOT_SIZE", "0.02"))
-        elif canonical_sym == "XAG":
-            max_lot = float(os.getenv("XAG_MAX_LOT_SIZE", "0.05"))
-        elif canonical_sym == "OIL":
-            max_lot = float(os.getenv("CRUDE_MAX_LOT_SIZE", "0.50"))
-        elif canonical_sym == "US500":
-            max_lot = float(os.getenv("US500_MAX_LOT_SIZE", "1.0"))
-        elif canonical_sym in ["BTC", "ETH", "SOL"]:
-            max_lot = float(os.getenv("CRYPTO_MAX_LOT_SIZE", "0.10"))
-        else:
-            max_lot = float(os.getenv("FOREX_MAX_LOT_SIZE", "0.10"))
-
+        # 🐛 v1.7.1: caps por clase
+        max_lot = get_max_lot(canonical_sym)
         calculated_size = min(calculated_size, max_lot)
 
         # Ajuste a volume_min/step de MT5
+        s_info = mt5.symbol_info(symbol) if hasattr(mt5, 'symbol_info') else None
         if s_info:
             vol_step = getattr(s_info, 'volume_step', 0.01)
             vol_min = getattr(s_info, 'volume_min', 0.01)
@@ -339,15 +344,10 @@ class InstitutionalRiskGuardian:
         if s_info:
             broker_min = getattr(s_info, 'volume_min', 0.01)
             if broker_min > max_lot:
-                risk_with_broker_min_usd = broker_min * stop_distance * point_multiplier
+                risk_with_broker_min_usd = broker_min * stop_distance * contract_size
                 risk_with_broker_min_pct = (risk_with_broker_min_usd / self.current_equity) * 100.0
 
-                if canonical_sym == "XAU":
-                    base_risk_pct = float(os.getenv("GOLD_MAX_RISK_PCT", "0.3"))
-                elif canonical_sym in ["BTC", "ETH", "SOL"]:
-                    base_risk_pct = float(os.getenv("CRYPTO_MAX_RISK_PCT", "1.0"))
-                else:
-                    base_risk_pct = self.max_risk_per_trade_pct
+                base_risk_pct = get_risk_pct(canonical_sym)
                 max_acceptable_pct = base_risk_pct * self.BROKER_MIN_TOLERANCE_MULT
 
                 if risk_with_broker_min_pct <= max_acceptable_pct:
@@ -369,29 +369,26 @@ class InstitutionalRiskGuardian:
                         logger.error(f"🛡️ {msg}")
                         self._blocked_assets[canonical_sym] = msg
                         log_rejection(
-                            symbol=symbol,
-                            reason=msg,
-                            event_type="ASSET_BLOCKED",
+                            symbol=symbol, reason=msg, event_type="ASSET_BLOCKED",
                             details=(
                                 f"volume_min={broker_min}, cap={max_lot}, "
                                 f"stop_distance={stop_distance:.5f}, "
-                                f"contract_size={point_multiplier}, "
+                                f"contract_size={contract_size}, "
                                 f"riesgo_real={risk_with_broker_min_pct:.2f}%"
                             ),
-                            side=side,
-                            price=price
+                            side=side, price=price
                         )
                     return RiskVerdict(False, msg, 0.0, 0.0, 0.0, False)
 
         self._pending_orders_lock[canonical_sym] = time.time()
 
-        final_risk_usd = calculated_size * stop_distance * point_multiplier
+        final_risk_usd = calculated_size * stop_distance * contract_size
 
         logger.info(
             f"🎯 Señal {side} APROBADA por Risk Guardian. "
             f"Size: {calculated_size} lotes (Máx: {max_lot}) | "
             f"Riesgo: ${final_risk_usd:.2f} ({risk_pct:.2f}%) | "
-            f"Contract Size: {point_multiplier} | Stop: ${stop_distance:.5f}"
+            f"Contract Size: {contract_size} | Stop: ${stop_distance:.5f}"
         )
 
         return RiskVerdict(

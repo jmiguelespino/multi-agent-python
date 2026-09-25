@@ -2,7 +2,11 @@
 =============================================================================
 QUANTEDGE AI — AGENTE DE APRENDIZAJE CONTINUO (AGENTE 5)
 =============================================================================
-🔧 v1.2.1:
+🔧 v1.2.2:
+  • 🐛 BUG #8 de hora CORREGIDO: `updated_iso` ahora está en hora MT5 (UTC+3),
+    consistente con el resto del sistema.
+    Antes: usaba time.localtime() → hora local del PC (UTC−3)
+    Ahora: usa time_utils.now_mt5() → hora MT5 (UTC+3)
   • logger.propagate = False para evitar doble logging.
   • Guardrails anti-overfitting (v1.2).
 =============================================================================
@@ -14,8 +18,10 @@ import time
 import logging
 from typing import Dict, Any, List, Optional
 
+from time_utils import now_mt5
+
 logger = logging.getLogger("FeedbackLearner")
-logger.propagate = False  # 🔧 evita duplicación con el root logger
+logger.propagate = False
 
 LOGS_DIR = os.path.join(os.path.dirname(__file__), "logs")
 AUDIT_LOG_FILE = os.path.join(LOGS_DIR, "trade_audit_history.jsonl")
@@ -181,9 +187,14 @@ class ContinuousLearningAgent:
         atr_stop_mult = round(atr_stop_mult, 2)
         atr_profit_mult = round(atr_profit_mult, 2)
 
+        # 🐛 BUG #8 de hora CORREGIDO:
+        # updated_iso ahora está en hora MT5 (UTC+3) en lugar de hora local del PC.
+        # updated_timestamp se mantiene en epoch UTC (ms) para comparaciones.
+        mt5_now = now_mt5()
+
         optimized_config = {
-            "updated_timestamp": int(now * 1000),
-            "updated_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now)),
+            "updated_timestamp": int(mt5_now.timestamp() * 1000),
+            "updated_iso": mt5_now.isoformat(),
             "total_trades_analyzed": total_trades,
             "win_rate_pct": round(win_rate, 2),
             "total_pnl_usd": round(total_pnl, 2),
@@ -194,7 +205,7 @@ class ContinuousLearningAgent:
             "atr_stop_multiplier": atr_stop_mult,
             "atr_profit_multiplier": atr_profit_mult,
             "guardrails_applied": True,
-            "learner_version": "1.2.1",
+            "learner_version": "1.2.2",
         }
 
         try:
@@ -244,7 +255,7 @@ if __name__ == "__main__":
     agent = ContinuousLearningAgent()
     config = agent.analyze_and_optimize()
     print("\n" + "=" * 60)
-    print("📊 RESULTADO DE OPTIMIZACIÓN DEL AGENTE 5 (v1.2.1)")
+    print("📊 RESULTADO DE OPTIMIZACIÓN DEL AGENTE 5 (v1.2.2)")
     print("=" * 60)
     print(json.dumps(config, indent=2))
     print("=" * 60)

@@ -1,15 +1,15 @@
 {
-  "updated_timestamp": 1790301000000,
-  "updated_iso": "2026-09-24T22:50:00",
+  "updated_timestamp": 1790306400000,
+  "updated_iso": "2026-09-25T06:20:00+03:00",
   "total_trades_analyzed": 0,
   "win_rate_pct": 0.0,
   "total_pnl_usd": 0.0,
   "profit_factor": 0.0,
   "wins": 0,
   "losses": 0,
-  "min_confidence_threshold": 86.0,
-  "atr_stop_multiplier": 1.8,
+  "min_confidence_threshold": 90.0,
+  "atr_stop_multiplier": 2.0,
   "atr_profit_multiplier": 3.0,
   "guardrails_applied": true,
-  "learner_version": "1.2.1"
+  "learner_version": "1.2.2"
 }

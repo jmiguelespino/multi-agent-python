@@ -2,7 +2,12 @@
 =============================================================================
 QUANTEDGE AI — AUDITORÍA INSTITUCIONAL Y REGISTRO HISTÓRICO DE CICLO DE VIDA
 =============================================================================
-🔧 v1.2:
+🔧 v1.3:
+  • 🐛 BUG #2 de hora CORREGIDO: `iso_time` ahora está en hora MT5 (UTC+3),
+    consistente con los logs de consola.
+    Antes: "2026-09-25T02:31:01.871644Z" (UTC)
+    Ahora: "2026-09-25T05:31:01.871644+03:00" (MT5)
+  • `timestamp` se mantiene en epoch UTC (para comparaciones y cálculos).
   • Solo 1 archivo JSONL (eliminado ../public/).
   • Los rechazos comunes NO se escriben al JSONL (rate limiter).
   • Solo persisten eventos críticos (CIRCUIT_BREAKER, ASSET_BLOCKED).
@@ -16,6 +21,8 @@ import time
 import logging
 from datetime import datetime
 from typing import Dict, Any, Optional
+
+from time_utils import now_mt5_ms, now_mt5_iso
 
 logger = logging.getLogger("AuditLogger")
 logger.propagate = False
@@ -54,8 +61,11 @@ def log_audit_event(
     metadata: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
 
-    now_ms = int(time.time() * 1000)
-    iso_time = datetime.utcnow().isoformat() + "Z"
+    # 🐛 BUG #2 de hora CORREGIDO:
+    # timestamp → epoch UTC (ms) para comparaciones
+    # iso_time  → hora MT5 (UTC+3) con sufijo "+03:00"
+    now_ms = now_mt5_ms()
+    iso_time = now_mt5_iso()
 
     # Normalizar side si es Enum
     if side is not None and hasattr(side, "value"):
@@ -87,7 +97,6 @@ def log_audit_event(
     }
 
     # 🔧 v1.2: Solo escribimos al JSONL eventos importantes
-    # Los rechazos comunes (COOLDOWN, MAX_POSITIONS, QUOTA) NO se persisten.
     EVENTS_TO_NOT_PERSIST = {
         "COOLDOWN_BLOCKED",
         "MAX_POSITIONS_BLOCKED",
@@ -97,11 +106,9 @@ def log_audit_event(
 
     should_persist = True
 
-    # Si es un REJECTION común, no persistir
     if category == "REJECTION" and event_type not in IMPORTANT_REJECTION_EVENTS:
         should_persist = False
 
-    # Si está en la lista de eventos a no persistir, no persistir
     if event_type in EVENTS_TO_NOT_PERSIST:
         should_persist = False
 
@@ -119,14 +126,13 @@ def log_audit_event(
         "MAX_POSITIONS_BLOCKED",
         "QUOTA_REACHED",
         "ANALYSIS_CONFIDENCE_THRESHOLD",
-        "ORDER_REJECTED",  # ya lo maneja risk_guardian con rate limiter
+        "ORDER_REJECTED",
     }
 
     if event_type in EVENTS_TO_SILENCE_IN_CONSOLE:
         return record
 
     if category == "CLOSURE":
-        # Los cierres se muestran como INFO breve
         logger.info(f"📉 {symbol} | {event_type} | PnL: ${pnl_usd if pnl_usd else 0:.2f}")
     elif category == "PROTECTION":
         logger.info(f"🛡️ [BLINDAJE] {symbol} | {event_type}: {reason} | SL: ${old_stop_loss} ➔ ${new_stop_loss}")
@@ -179,7 +185,6 @@ def log_rejection(
             metadata=metadata
         )
     else:
-        # Rechazos comunes: solo debug (no persistir)
         logger.debug(f"⏸️  [Rechazo] {symbol} | {event_type}: {reason}")
         return {"rejected": True, "persisted": False, "event_type": event_type}
 
@@ -240,7 +245,6 @@ def log_order_filled(
     order_id: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None
 ):
-    # Normalizar side si es Enum
     side_str = side.value if hasattr(side, "value") else str(side)
 
     return log_audit_event(

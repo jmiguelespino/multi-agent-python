@@ -420,12 +420,13 @@ def test_mejora5_feature_agent_min_atr():
 
     casos = [
         ("XAUUSD", 0.50),
-        ("XAGUSD", 0.02),   # 🆕
-        ("US500",  0.50),   # 🆕
+        ("XAGUSD", 0.02),
+        ("US500",  0.50),
         ("XTIUSD", 0.05),
-        ("BTCUSD", 50.0),
-        ("ETHUSD", 3.0),
-        ("SOLUSD", 0.10),
+        # 🆕 v1.4.1: MIN_ATR de cripto recalibrados
+        ("BTCUSD", 20.0),    # antes 50.0
+        ("ETHUSD", 1.0),     # antes 3.0
+        ("SOLUSD", 0.03),    # antes 0.10
         ("EURUSD", 0.00015),
     ]
 
@@ -440,7 +441,6 @@ def test_mejora5_feature_agent_min_atr():
             all_ok = False
 
     return all_ok
-
 
 # =============================================================================
 # 🆕 TEST 13 — Coherencia canónica en 4 módulos (incluye mt5_bridge)

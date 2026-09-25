@@ -2,18 +2,18 @@
 =============================================================================
 QUANTEDGE AI — MOTOR AUTÓNOMO DE TRADING INSTITUCIONAL MULTI-ACTIVO (UTC+3)
 =============================================================================
-🔧 v1.7.1:
-  • FIX #1 activo (vía risk_guardian + execution_agent → OIL unificado).
-  • FIX #2 activo (vía signal_agent → filtro M15).
-  • 🐛 BUG #1 CORREGIDO: is_buyer_maker ahora se infiere con tick rule
-    (bid/ask/mid) en lugar de la comparación errónea last < ask.
-  • DECISION_THROTTLE_SECONDS = 1.0s (menos carga IPC).
-  • Soporte para XAGUSD (Plata) y US500 (S&P 500).
-  • Cooldown de 5 min tras "Invalid stops".
-  • Cooldown de 30 min tras "Market closed".
-  • Capital leído dinámicamente desde MT5.
+🔧 v1.7.3:
+  • 🆕 HEARTBEAT al JSONL cada 15 min para trazabilidad.
+  • 🆕 BOT_STARTED al JSONL al arrancar.
+  • 🐛 Fix del log "WARMUP completado" que aparecía cada 5 min aunque ya
+    estuviera completado.
+  • Warmup mínimo: 20 velas cerradas por símbolo (~20 min).
+  • Eliminado ORDER_FILLED duplicado.
+  • FIX #1 activo (OIL unificado).
+  • FIX #2 activo (filtro M15).
+  • BUG #1 CORREGIDO: infer_is_buyer_maker con tick rule.
+  • DECISION_THROTTLE_SECONDS = 1.0s.
   • Reporte diario integrado (auto-disparo 23:59 MT5).
-  • Control remoto vía control_state.json.
 =============================================================================
 """
 
@@ -30,7 +30,7 @@ from collections import defaultdict
 from dotenv import load_dotenv
 
 # =============================================================================
-# 🔧 FIX: Logger y TZ_MT5 al INICIO (evita NameError en funciones tempranas)
+# Logger y TZ_MT5 al INICIO
 # =============================================================================
 TZ_MT5 = timezone(timedelta(hours=3))
 
@@ -58,6 +58,8 @@ env_file = BASE_DIR.parent / '.env'
 if not env_file.exists():
     env_file = BASE_DIR / '.env'
 load_dotenv(dotenv_path=env_file)
+# 🆕 Logging DEBUG de SignalAgent para ver rechazos
+logging.getLogger("SignalAgent").setLevel(logging.DEBUG)
 
 import MetaTrader5 as mt5
 from signal_agent import StrategySignalAgent
@@ -67,7 +69,7 @@ from feature_agent import IngestionFeatureAgent
 from feedback_learner import ContinuousLearningAgent
 from data_streamer import Tick
 from telegram_notifier import send_telegram_alert
-from audit_logger import log_order_filled, log_rejection
+from audit_logger import log_order_filled, log_rejection, log_audit_event
 
 # =============================================================================
 # CONSTANTES Y RUTAS
@@ -484,26 +486,9 @@ def close_all_positions() -> int:
 
 
 # =============================================================================
-# 🐛 BUG #1 CORREGIDO — inferencia de agresor (is_buyer_maker) vía tick rule
+# infer_is_buyer_maker (BUG #1 corregido)
 # =============================================================================
 def infer_is_buyer_maker(tick_info) -> bool:
-    """
-    🐛 BUG #1 CORREGIDO.
-
-    En Binance, is_buyer_maker viene explícito en el payload del trade.
-    En MT5 NO existe: hay que inferirlo.
-
-    Regla de Lee-Ready simplificada (tick rule):
-      • last >= ask  → comprador agresivo  → is_buyer_maker = False
-      • last <= bid  → vendedor agresivo   → is_buyer_maker = True
-      • bid < last < ask → fallback por mid-price:
-            last >= mid → False (comprador)
-            last <  mid → True  (vendedor)
-
-    Returns:
-        True  → el agresor fue el vendedor (sell aggressor)
-        False → el agresor fue el comprador (buy aggressor)
-    """
     try:
         bid = float(getattr(tick_info, "bid", 0.0) or 0.0)
         ask = float(getattr(tick_info, "ask", 0.0) or 0.0)
@@ -511,17 +496,14 @@ def infer_is_buyer_maker(tick_info) -> bool:
     except Exception:
         return False
 
-    # Sin last válido → neutro (no contamina demasiado el CVD)
     if last <= 0 or bid <= 0 or ask <= 0:
         return False
 
-    # Si el last está fuera del spread → regla directa
     if last >= ask:
-        return False  # comprador agresivo
+        return False
     if last <= bid:
-        return True   # vendedor agresivo
+        return True
 
-    # Dentro del spread → fallback por mid-price
     mid = (bid + ask) / 2.0
     return last < mid
 
@@ -642,8 +624,8 @@ async def main():
     signal_agents = {
         s: StrategySignalAgent(
             symbol=s,
-            min_confidence_threshold=initial_learned_config.get("min_confidence_threshold", 86.0),
-            atr_stop_multiplier=initial_learned_config.get("atr_stop_multiplier", 1.8),
+            min_confidence_threshold=initial_learned_config.get("min_confidence_threshold", 90.0),
+            atr_stop_multiplier=initial_learned_config.get("atr_stop_multiplier", 2.0),
             atr_profit_multiplier=initial_learned_config.get("atr_profit_multiplier", 3.0)
         )
         for s in SYMBOLS_LIST
@@ -667,11 +649,30 @@ async def main():
     logger.info(f"  • Resueltos: {resolved_symbols}")
     logger.info(f"  • Control remoto: ACTIVO ({CONTROL_STATE_FILE})")
     logger.info(f"  • Reporte diario: {DAILY_REPORT_HOUR:02d}:{DAILY_REPORT_MINUTE:02d} (hora MT5 UTC+3)")
+    logger.info(f"  • Warmup mínimo: 20 velas cerradas por símbolo (~20 min)")
     logger.info("=" * 70)
+
+    # 🆕 v1.7.3: BOT_STARTED al JSONL
+    log_audit_event(
+        event_type="BOT_STARTED",
+        category="SYSTEM",
+        symbol="SYSTEM",
+        reason="QuantEdge AI v1.7.3 arrancado",
+        details=f"MT5 #{MT5_ACCOUNT} | {len(SYMBOLS_LIST)} símbolos | capital ${capital_base:,.2f} | warmup=20 velas",
+        metadata={
+            "version": "1.7.3",
+            "phase": "FASE_1 + Bloque2 + Bloque3 + Bloque4",
+            "warmup_min_candles": 20,
+            "symbols": SYMBOLS_LIST,
+            "capital_base": round(capital_base, 2),
+        }
+    )
+    logger.info("📝 BOT_STARTED registrado en JSONL")
 
     last_heartbeat_timestamp = datetime.now(TZ_MT5).timestamp()
     last_paused_log = 0.0
     last_report_check = 0.0
+    last_warmup_log = 0.0
 
     failed_orders_cooldown: Dict[str, float] = {}
     market_closed_cooldown: Dict[str, float] = {}
@@ -739,6 +740,19 @@ async def main():
                     risk_guardian.sync_active_positions([p.symbol for p in positions])
                     execution_oms.sync_mt5_positions(positions, risk_guardian)
 
+                # 🐛 v1.7.3: FIX del log spameante de warmup
+                # Solo loguea si hay al menos un símbolo en warmup.
+                if now_wall - last_warmup_log > 300:
+                    last_warmup_log = now_wall
+                    warmup_status = []
+                    for sym in SYMBOLS_LIST:
+                        fa = feature_agents[sym]
+                        if not fa.is_ready():
+                            warmup_status.append(f"{sym}({fa.candles_closed_count}/20)")
+                    if warmup_status:
+                        logger.info(f"⏳ WARMUP en curso: {', '.join(warmup_status)}")
+                    # (nada si todos están ready)
+
                 for sym in SYMBOLS_LIST:
                     now_ts = time.time()
                     if sym in failed_orders_cooldown:
@@ -758,7 +772,6 @@ async def main():
                     spread = tick_info.ask - tick_info.bid
                     spread_bps = (spread / price) * 10000.0 if price > 0 else 0.0
 
-                    # 🐛 BUG #1 CORREGIDO: usar tick rule (bid/ask/mid) en lugar de last < ask
                     is_buyer_maker = infer_is_buyer_maker(tick_info)
                     qty = float(tick_info.volume_real) if hasattr(tick_info, 'volume_real') and tick_info.volume_real > 0 else 1.0
 
@@ -823,21 +836,6 @@ async def main():
                                     take_profit=signal.suggested_take_profit
                                 )
 
-                                log_order_filled(
-                                    symbol=sym,
-                                    side=side_str,
-                                    volume=verdict.authorized_size_units,
-                                    fill_price=res.price,
-                                    sl=signal.suggested_stop_loss,
-                                    tp=signal.suggested_take_profit,
-                                    ticket=res.order,
-                                    metadata={
-                                        "execution_latency_ms": execution_latency_ms,
-                                        "slippage_usd": slippage_usd,
-                                        "confidence_percent": signal.confidence_percent
-                                    }
-                                )
-
                                 send_telegram_alert(
                                     "🎯 *ORDEN SNIPER EJECUTADA*\n"
                                     f"• Activo: `{sym}` (`{resolved_sym}`)\n"
@@ -896,8 +894,10 @@ async def main():
                                 vwap_str = "SOBRE VWAP" if feat_diag.price > feat_diag.vwap else "BAJO VWAP"
                                 rsi_val = f"{feat_diag.rsi14:.1f}"
                                 atr_val = f"{feat_diag.atr14:.5f}"
+                                ready_str = "READY" if feat_diag.is_ready else f"WARMUP {feat_diag.candles_closed}/20"
                             else:
                                 trend_str = vwap_str = rsi_val = atr_val = "N/D"
+                                ready_str = "WARMUP 0/20"
 
                             block_info = ""
                             if sym in market_closed_cooldown:
@@ -913,9 +913,25 @@ async def main():
 
                             logger.info(
                                 f"  • {sym:<7} ({res_s:<8}) | ${p_curr:<10.5f} | "
-                                f"{trend_str:<7} | {vwap_str:<10} | RSI: {rsi_val:<6} | ATR: {atr_val}{block_info}"
+                                f"{trend_str:<7} | {vwap_str:<10} | RSI: {rsi_val:<6} | ATR: {atr_val} | {ready_str}{block_info}"
                             )
                 logger.info("=" * 70)
+
+                # 🆕 v1.7.3: HEARTBEAT al JSONL
+                positions_now = mt5.positions_get() if has_mt5 else None
+                log_audit_event(
+                    event_type="HEARTBEAT",
+                    category="SYSTEM",
+                    symbol="SYSTEM",
+                    reason="Diagnóstico periódico multi-activo",
+                    details=f"Posiciones abiertas: {len(positions_now) if positions_now else 0} | Capital: ${capital_base:,.2f}",
+                    metadata={
+                        "symbols_count": len(SYMBOLS_LIST),
+                        "positions_count": len(positions_now) if positions_now else 0,
+                        "capital": round(capital_base, 2),
+                        "bot_alive": True,
+                    }
+                )
 
         except Exception as loop_err:
             logger.error(f"Error en bucle multi-activo: {loop_err}")
