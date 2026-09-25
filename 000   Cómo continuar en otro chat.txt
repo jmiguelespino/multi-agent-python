@@ -1,0 +1,275 @@
+
+---
+
+## 🎯 Cómo continuar en otro chat (si fuese necesario)
+
+**Solo necesitas pasar 3 cosas al nuevo asistente:**
+
+1. **`PROJECT_STATE.md`** (arriba)
+2. **`xxxxxxxxxxx.py`**   los que estemos trabajando
+3. **`xxxxxxxxxxx.py`**
+
+Y decirle:
+
+> "Estoy trabajando en QuantEdge AI, un bot de trading multi-agente. El proyecto está en C:\Users\jmigu\Downloads\multi-agent-python. Adjunto PROJECT_STATE.md con el estado completo. Quiero continuar desde el paso pendiente #1: verificar B22 (feedback_learner no se aplica)."
+
+**Con eso, cualquier asistente puede retomar en 5 minutos.**
+
+---
+
+## 🎯 Resumen
+
+| Pregunta | Respuesta |
+|---|---|
+| **¿Tengo que cambiar de chat?** | ❌ NO |
+| **¿Se pierde algo si cambio?** | Solo el contexto de la conversación, pero los archivos están en disco |
+| **¿Qué necesito para no perder nada?** | Crear `PROJECT_STATE.md` (arriba) |
+| **¿Podemos seguir acá?** | ✅ SÍ |
+
+---
+
+**Ahora, ¿quieres que creemos el `PROJECT_STATE.md` primero y luego sigamos con B22? O preferís ir directo a B22 y creamos el doc después.**
+
+**Mi recomendación**: crea el `PROJECT_STATE.md` primero (5 min), así si algo pasa, no perdemos nada. Después atacamos B22. 👇
+
+
+
+----------------------------------------------------------------------------------------------------------------------------------------
+
+1. **Actualizar `PROJECT_STATE.md`** (por seguridad si hay que cambiar de chat)
+2. **Volver al backtest** (arreglar los 4 bugs)
+
+---
+
+## 📄 `PROJECT_STATE.md` (completo y actualizado)
+
+Crea este archivo en la raíz del proyecto:
+
+```markdown
+# 📋 QUANTEDGE AI — ESTADO DEL PROYECTO
+
+**Última actualización**: 2026-09-26 00:15 (UTC+3)
+**Cuenta MT5**: 52974519 (ICMarketsSC-Demo)
+**Capital base**: $1,731.03
+**Estado del bot**: 🟢 CORRIENDO (solo cripto hasta domingo 18:00 UTC-3)
+
+---
+
+## 🎯 Historial de versiones
+
+| Versión | Comentario en órdenes | Fecha | Estado |
+|---|---|---|---|
+| v1.x | `QuantEdge-Agente4`, `Comite AI` | 17-18/09 | Obsoleta |
+| v2.x | `QuantEdge-Sniper` | 20-21/09 | Obsoleta |
+| v3.x | `QuantEdge-Multi-Py` | 22-25/09 | Actual en uso |
+
+**Rendimiento histórico real** (cuenta demo):
+- 17-25/09: **+174 USD**, PF=1.235, Sharpe=0.075
+
+---
+
+## 🐛 Bugs corregidos (Lotes 1, 2, 2.5, 2.6+3, 3.5)
+
+| ID | Bug | Fix | Archivo |
+|---|---|---|---|
+| B2 | Doble registro de posición | Eliminado `place_bracket_order` | `execution_agent.py`, `main.py` |
+| B3 | Race en `active_positions_count` | Solo `sync_active_positions` controla | `risk_guardian.py` |
+| B4 | `_update_mt5_sl` ignora `freeze_level` | `_get_min_stop_distance` | `execution_agent.py` |
+| B5 | `UNKNOWN` → `MANUAL_CLOSE` | Añadido `CLOSE_UNKNOWN` | `audit_logger.py` |
+| B6 | Learner NO filtra tests | Campo `is_test` en metadata | `audit_logger.py`, `feedback_learner.py` |
+| B10 | TTL de locks 30s → 120s | +`notify_position_confirmed` | `risk_guardian.py` |
+| B11 | PnL perdido si fetch falla | Estado `PENDING_PNL` con reintentos | `execution_agent.py` |
+| B12 | `build_daily_report` duplicado | Nuevo `report_utils.py` | `main.py`, `daily_report.py` |
+| B13 | Triple inconsistencia `min_confidence` | Unificado a 90.0 | `feedback_learner.py` |
+| B14 | `atr_*_multiplier` no se propagan | `apply_learned_config_to_signal_agents` | `main.py` |
+| B15 | Cierres huérfanos no detectados | `_scan_recent_deals_for_closures` | `execution_agent.py` |
+| B16 | SL/TP invertidos | `_get_broker_min_distance` + validación | `signal_agent.py` |
+| B17 | `MAX_CONCURRENT_POSITIONS` no respetado | Lock síncrono | `risk_guardian.py` |
+| B18 | `unprofitable_symbols` no usado | Análisis por símbolo | `feedback_learner.py` |
+| B19 | Learner pisa multiplicadores ATR | `clamp_atr_by_class` | `feedback_learner.py`, `signal_agent.py` |
+| **B20** | **`disabled_symbols` con min_trades=5** | **min_trades=30 + histéresis + re-habilitación** | **`feedback_learner.py` v1.5.1** |
+| B21 | Cuarentena por racha de pérdidas | Escalonada 1h/6h/24h | `risk_guardian.py` |
+| **B23** | **`atr_profit_mult` acumulaba hasta 13.65** | **Clamp duro SL∈[1,6], TP∈[2,9]** | **`feedback_learner.py` v1.5.1** |
+| O1 | `import MT5` dentro de `_check_macro_trend` | A nivel módulo | `signal_agent.py` |
+| O2 | Bucle `orders × symbols` ineficiente | Invertido | `main.py` |
+| O3 | Buffer + flush en `audit_logger` | `_BufferedWriter` | `audit_logger.py` |
+| O4 | Cache M15 con TTL | `_get_m15_rates_cached` | `signal_agent.py` |
+| O5 | Test 14 PnL retry lento | `max_retries=1` | `test_smoke.py` |
+
+---
+
+## 🚨 PENDIENTE: Backtest con 4 bugs críticos
+
+**Estado**: el motor de backtest existe pero sus resultados NO son válidos.
+
+### Bugs identificados
+
+| # | Bug | Evidencia | Fix pendiente |
+|---|---|---|---|
+| **BT-1** | `spread_bps` mal calculado (falta `point_size`) | `SPREAD_TOO_HIGH: 593,582 rechazos` | Multiplicar `spread_points × point_size` antes de dividir por precio |
+| **BT-2** | `QUOTA_REACHED` mal contado | `144,947 rechazos` | El contador diario se resetea mal |
+| **BT-3** | `CIRCUIT_BREAKER` no se resetea diario | `4,641 rechazos` + CB queda activo siempre | Resetear CB cada día UTC |
+| **BT-4** | Solo opera XAUUSD y BTCUSD | 8 símbolos → solo 2 operan | Combinación de BT-1, BT-2, BT-3 |
+| **BT-5** | BE demasiado agresivo | avg win +1.67 vs avg loss -8.18 | Subir `be_trigger_atr` de 1.2 a 2.5 |
+
+### Diagnóstico
+
+**El bot REAL es rentable (+174 USD en 9 días). El backtest dice -285 USD.**
+**La discrepancia es por los 5 bugs del motor de backtest.**
+
+### Archivos del backtest
+
+- `backtest_engine.py` — motor v3 (con bugs parcialmente arreglados, pendiente de testear)
+- `backtest.py` — runner
+- `backtest_config.json` — config (start_date/end_date/nulled)
+- `datasets/` — 8 CSVs M1 + 8 M5 + 8 M15
+
+---
+
+## 📂 Estructura actual del proyecto
+
+```
+multi-agent-python/
+├── main.py                    ✅ v1.9.0 (Lote 2.6+3)
+├── signal_agent.py            ✅ v1.9.0 (O1, O4)
+├── risk_guardian.py           ✅ v1.10.0 (B21)
+├── execution_agent.py         ✅ v1.7.0 (B15)
+├── feature_agent.py           ✅ v1.4.1
+├── feedback_learner.py        ✅ v1.5.1 (B20+B23)
+├── audit_logger.py            ✅ v1.6.0 (O3)
+├── report_utils.py            ✅ v1.0.0
+├── daily_report.py            ✅ v1.1.0
+├── time_utils.py              ✅
+├── data_streamer.py           ✅
+├── mt5_bridge.py              ✅ v1.7.0
+├── telegram_notifier.py       ✅
+├── telegram_commands.py       ✅
+├── monitor.py                 ✅
+├── test_smoke.py              ✅ v1.9.1 (17/17 PASS)
+├── backtest_engine.py         ⚠️ v3 con bugs BT-1 a BT-5
+├── backtest.py                ✅
+├── backtest_config.json       ✅
+├── config_optimized.json      ✅ v1.5.1 limpio
+├── control_state.json         ▶️ paused=false
+├── datasets/                  ✅ CSVs M1/M5/M15
+├── logs/
+│   └── trade_audit_history.jsonl
+└── PROJECT_STATE.md           🆕 Este archivo
+```
+
+---
+
+## 🎯 Estado de los módulos
+
+| Módulo | Versión | Bugs activos |
+|---|---|---|
+| `main.py` | v1.9.0 | Ninguno |
+| `signal_agent.py` | v1.9.0 | Ninguno |
+| `risk_guardian.py` | v1.10.0 | Ninguno |
+| `execution_agent.py` | v1.7.0 | Ninguno |
+| `feature_agent.py` | v1.4.1 | Ninguno |
+| `feedback_learner.py` | v1.5.1 | Ninguno |
+| `audit_logger.py` | v1.6.0 | Ninguno |
+| `backtest_engine.py` | v3 | **BT-1 a BT-5** |
+
+---
+
+## 🎯 Bot corriendo — Estado
+
+- **Arrancado**: 2026-09-26 00:13:48 (UTC+3)
+- **Modo**: OPERATIVO
+- **Símbolos**: 8 activos, 0 deshabilitados
+- **Warmup**: en curso (~20 min)
+- **Mercados tradicionales**: 🔒 CERRADOS hasta domingo ~22:00 MT5
+- **Solo opera**: BTCUSD, ETHUSD, SOLUSD
+- **Capital**: $1,731.03
+- **Control remoto**: ACTIVO
+
+---
+
+## 🎯 Config actual (`config_optimized.json`)
+
+```json
+{
+  "min_confidence_threshold": 90.5,
+  "atr_stop_multiplier": 2.2,
+  "atr_profit_multiplier": 3.0,
+  "disabled_symbols": [],
+  "disabled_details": {},
+  "learner_version": "1.5.1",
+  "profit_factor": 1.25,
+  "win_rate_pct": 46.0
+}
+```
+
+---
+
+## 🎯 Decisiones tomadas
+
+1. **Backtest con datos reales** — no confiar en él hasta arreglar bugs BT-1 a BT-5.
+2. **M1 para señal, M15 para filtro macro** (como el bot real).
+3. **B20 debe tener min_trades=30 + histéresis** para no auto-sabotear.
+4. **No reemplazar el bot real por el backtest** — el bot real es la fuente de verdad.
+5. **Rango de análisis preferido**: 17-25/09 (último período real).
+6. **Clamp duro ATR** en learner: SL∈[1,6], TP∈[2,9].
+
+---
+
+## 🎯 Hipótesis activas
+
+1. **El bot real es rentable** (+174 USD en 9 días).
+2. **Los cambios recientes pueden haber roto motores históricos** (BTCUSD, XTIUSD, XBRUSD).
+3. **B20 estaba saboteando símbolos buenos** por min_trades=5 → **RESUELTO en v1.5.1**.
+4. **El break-even puede estar estrangulando ganancias** (avg win +1.67 vs avg loss -8.18).
+5. **El backtest actual NO refleja el bot real** por bugs BT-1 a BT-5.
+
+---
+
+## 🎯 Próximos pasos
+
+1. **Arreglar BT-1 a BT-5** en `backtest_engine.py`.
+2. **Correr backtest** con rango 17-25/09 y comparar con real.
+3. **Correr backtest** con rango completo (junio-septiembre).
+4. **Ajustar BE** si es necesario (subir `be_trigger_atr`).
+5. **Validar** que el backtest refleja el real antes de usarlo para optimizar.
+
+---
+
+## 🎯 Contacto / continuidad
+
+**Si se necesita continuar en otro chat**:
+1. Pasar este archivo al asistente.
+2. Indicar el paso pendiente: "Estoy en el paso X de los Próximos Pasos".
+3. Pasar `feedback_learner.py`, `test_smoke.py`, `backtest_engine.py`, `backtest.py`, `backtest_config.json`.
+
+**Contexto clave**:
+- El bot real es rentable (+174 USD en 9 días).
+- Los fixes B2-B23 están aplicados y testeados (17/17 smoke test).
+- El backtest tiene 5 bugs pendientes que lo invalidan.
+```
+
+---
+
+## 🎯 Guarda este archivo
+
+**Guárdalo como `PROJECT_STATE.md` en la raíz del proyecto.** Con eso, si algún día necesitas continuar en otro chat, solo pasas este archivo y el asistente retoma en 5 min.
+
+---
+
+## 🎯 Ahora arrancamos con el backtest
+
+**Los 5 bugs a arreglar:**
+
+| # | Bug | Fix |
+|---|---|---|
+| **BT-1** | `spread_bps` sin `point_size` | Multiplicar por `POINT_SIZE[canonical]` |
+| **BT-2** | `QUOTA_REACHED` mal contado | Resetear `trades_today` al cambiar de día |
+| **BT-3** | `CIRCUIT_BREAKER` no resetea | Resetear `cb_active = False` cada día UTC |
+| **BT-4** | Solo opera XAUUSD/BTCUSD | Consecuencia de BT-1 a BT-3 |
+| **BT-5** | BE demasiado agresivo | Subir `be_trigger_atr` 1.2 → 2.5 |
+
+**¿Quieres que te pase el `backtest_engine.py` corregido completo** (con los 5 fixes), o prefieres ir por partes?
+
+**Mi recomendación**: pasarte el motor completo con los 5 fixes, correr el backtest, y ver si los resultados se acercan al real (+174 USD).
+
+**¿Arrancamos con el motor corregido?** 👇

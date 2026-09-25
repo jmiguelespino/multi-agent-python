@@ -2,20 +2,16 @@
 =============================================================================
 QUANTEDGE AI — AGENTE DE APRENDIZAJE CONTINUO (AGENTE 5)
 =============================================================================
-🔧 v1.4.0 — LOTE FUSIONADO 2.6+3:
-  • 🐛 B19 CORREGIDO: el learner YA NO pisa los multiplicadores ATR
-    específicos por clase de activo. Ahora respeta límites por clase:
-      - Oro:  SL ∈ [3.5, 6.0], TP ∈ [5.0, 9.0]
-      - Cripto: SL ∈ [1.8, 3.5], TP ∈ [2.5, 6.0]
-      - Forex: SL ∈ [1.0, 2.0], TP ∈ [1.5, 3.0]
-      - etc.
-    El valor global se usa solo si la clase no tiene override.
-  • 🐛 B20 CORREGIDO: el learner ahora genera `disabled_symbols` basado
-    en PF histórico:
-      - PF < 0.5 (≥5 trades): deshabilitar 24h
-      - PF < 0.8 (≥5 trades): deshabilitar 6h
-      - PF < 1.0 (≥5 trades): solo loguear
-  • v1.3.0 heredado: B6 (filtro de tests), B18 (análisis por símbolo).
+🔧 v1.5.1 — Lote 3.5 (fixes urgentes B20 + B23):
+  • 🐛 B20.1 CORREGIDO: min_trades_to_disable subido de 5 a 30.
+  • 🐛 B20.2 CORREGIDO: PF calculado sobre últimos 50 trades.
+  • 🐛 B20.3 CORREGIDO: histéresis (PF bajo Y WR bajo).
+  • 🐛 B20.4 CORREGIDO: re-habilitación automática.
+  • 🐛 B23 CORREGIDO: clamp duro para atr_stop_mult y atr_profit_mult.
+    Antes: el learner multiplicaba por 1.15/1.10 cada vez que corría,
+    acumulando valores absurdos como 13.65.
+    Ahora: SL ∈ [1.0, 6.0] y TP ∈ [2.0, 9.0].
+  • v1.4.0 heredado: B19 (límites ATR por clase), B6 (filtro tests).
 =============================================================================
 """
 
@@ -23,7 +19,7 @@ import os
 import json
 import time
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 
@@ -57,29 +53,18 @@ ATR_LIMITS_BY_CLASS = {
 
 def get_class_of(symbol: str) -> str:
     s = symbol.upper()
-    if "XAU" in s or "GOLD" in s:
-        return "XAU"
-    if "XAG" in s or "SILVER" in s:
-        return "XAG"
-    if any(k in s for k in ["WTI", "XTI", "BRENT", "XBR", "OIL"]):
-        return "OIL"
-    if "US500" in s or "SP500" in s or "SPX" in s:
-        return "US500"
-    if "BTC" in s:
-        return "BTC"
-    if "ETH" in s:
-        return "ETH"
-    if "SOL" in s:
-        return "SOL"
-    if any(fx in s for fx in ["EUR", "GBP", "JPY", "AUD", "NZD"]):
-        return "FOREX"
+    if "XAU" in s or "GOLD" in s: return "XAU"
+    if "XAG" in s or "SILVER" in s: return "XAG"
+    if any(k in s for k in ["WTI", "XTI", "BRENT", "XBR", "OIL"]): return "OIL"
+    if "US500" in s or "SP500" in s or "SPX" in s: return "US500"
+    if "BTC" in s: return "BTC"
+    if "ETH" in s: return "ETH"
+    if "SOL" in s: return "SOL"
+    if any(fx in s for fx in ["EUR", "GBP", "JPY", "AUD", "NZD"]): return "FOREX"
     return "DEFAULT"
 
 
-def clamp_atr_by_class(symbol_class: str, sl: float, tp: float) -> tuple[float, float]:
-    """
-    🐛 B19: restringe sl/tp a los límites de la clase.
-    """
+def clamp_atr_by_class(symbol_class: str, sl: float, tp: float) -> tuple:
     limits = ATR_LIMITS_BY_CLASS.get(symbol_class, ATR_LIMITS_BY_CLASS["DEFAULT"])
     sl_min, sl_max = limits["sl"]
     tp_min, tp_max = limits["tp"]
@@ -87,13 +72,38 @@ def clamp_atr_by_class(symbol_class: str, sl: float, tp: float) -> tuple[float, 
 
 
 # =============================================================================
-# 🐛 B20: umbrales para deshabilitar símbolos
+# 🐛 B20: umbrales para deshabilitar símbolos (v1.5.0 — con histéresis)
 # =============================================================================
 DISABLE_THRESHOLDS = {
-    "critical": {"pf_max": 0.5, "min_trades": 5, "disable_hours": 24},
-    "severe":   {"pf_max": 0.8, "min_trades": 5, "disable_hours": 6},
-    "log_only": {"pf_max": 1.0, "min_trades": 5, "disable_hours": 0},
+    # Crítico: se requiere PF MUY bajo Y WR MUY bajo Y trades suficientes
+    "critical": {
+        "pf_max": 0.5,
+        "wr_max": 40.0,
+        "min_trades": 30,
+        "disable_hours": 24,
+    },
+    "severe": {
+        "pf_max": 0.8,
+        "wr_max": 45.0,
+        "min_trades": 30,
+        "disable_hours": 6,
+    },
+    "log_only": {
+        "pf_max": 1.0,
+        "wr_max": 50.0,
+        "min_trades": 30,
+        "disable_hours": 0,
+    },
 }
+
+# 🐛 B20.2: ventana temporal para calcular PF/WR
+PF_LOOKBACK_DAYS = 30
+PF_LOOKBACK_TRADES = 50  # últimos N trades
+
+# 🐛 B20.4: re-habilitación automática
+REENABLE_MIN_TRADES = 10
+REENABLE_MIN_PF = 1.0
+REENABLE_MIN_WR = 45.0
 
 
 class ContinuousLearningAgent:
@@ -186,43 +196,75 @@ class ContinuousLearningAgent:
 
         return records
 
-    def analyze_by_symbol(self, closures: List[dict]) -> Dict[str, dict]:
-        by_symbol = defaultdict(lambda: {
-            "trades": 0, "wins": 0, "losses": 0,
-            "pnl": 0.0, "gross_profit": 0.0, "gross_loss": 0.0,
-        })
+    def _filter_recent_closures(self, closures: List[dict]) -> List[dict]:
+        """
+        🐛 B20.2: devuelve solo los últimos N cierres (por timestamp).
+        Esto evita que un día malo de hace 20 días hunda el PF.
+        """
+        if len(closures) <= PF_LOOKBACK_TRADES:
+            return closures
+        sorted_by_time = sorted(closures, key=lambda r: r.get("timestamp", 0), reverse=True)
+        return sorted_by_time[:PF_LOOKBACK_TRADES]
 
+    def analyze_by_symbol(self, closures: List[dict]) -> Dict[str, dict]:
+        """
+        🐛 B20.2: ahora analiza solo los últimos PF_LOOKBACK_TRADES por símbolo.
+        """
+        by_symbol_trades: Dict[str, List[dict]] = defaultdict(list)
         for r in closures:
             sym = str(r.get("symbol", "UNKNOWN")).upper()
-            pnl = float(r.get("pnl_usd", 0) or 0)
-            by_symbol[sym]["trades"] += 1
-            by_symbol[sym]["pnl"] += pnl
-            if pnl > 0:
-                by_symbol[sym]["wins"] += 1
-                by_symbol[sym]["gross_profit"] += pnl
-            else:
-                by_symbol[sym]["losses"] += 1
-                by_symbol[sym]["gross_loss"] += abs(pnl)
+            by_symbol_trades[sym].append(r)
 
         result = {}
-        for sym, d in by_symbol.items():
-            wr = (d["wins"] / d["trades"]) * 100 if d["trades"] > 0 else 0.0
-            pf = (d["gross_profit"] / d["gross_loss"]) if d["gross_loss"] > 0 else 999.0
+        for sym, trades in by_symbol_trades.items():
+            trades_sorted = sorted(trades, key=lambda r: r.get("timestamp", 0), reverse=True)
+            trades_recent = trades_sorted[:PF_LOOKBACK_TRADES]
+
+            trades_count = len(trades_recent)
+            if trades_count == 0:
+                continue
+
+            wins = 0
+            losses = 0
+            gross_profit = 0.0
+            gross_loss = 0.0
+            pnl_sum = 0.0
+
+            for t in trades_recent:
+                pnl = float(t.get("pnl_usd", 0) or 0)
+                pnl_sum += pnl
+                if pnl > 0:
+                    wins += 1
+                    gross_profit += pnl
+                else:
+                    losses += 1
+                    gross_loss += abs(pnl)
+
+            wr = (wins / trades_count) * 100 if trades_count > 0 else 0.0
+            pf = (gross_profit / gross_loss) if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0)
+
             result[sym] = {
-                "trades": d["trades"],
-                "wins": d["wins"],
-                "losses": d["losses"],
+                "trades": trades_count,
+                "trades_total_hist": len(trades),
+                "wins": wins,
+                "losses": losses,
                 "win_rate_pct": round(wr, 2),
-                "pnl_usd": round(d["pnl"], 2),
+                "pnl_usd": round(pnl_sum, 2),
                 "profit_factor": round(pf, 3),
                 "is_profitable": pf > 1.0,
             }
         return result
 
-    def _compute_disabled_symbols(self, by_symbol: dict) -> tuple[List[str], Dict[str, dict]]:
+    def _compute_disabled_symbols(
+        self,
+        by_symbol: dict,
+        current_disabled: Dict[str, dict]
+    ) -> Tuple[List[str], Dict[str, dict]]:
         """
-        🐛 B20: calcula qué símbolos deben deshabilitarse según PF histórico.
-        Devuelve (lista_simbolos_deshabilitados, mapa_detalles).
+        🐛 B20.1 / B20.3 / B20.4:
+          - min_trades = 30
+          - Requiere PF bajo Y WR bajo simultáneamente
+          - Re-habilita automáticamente si el símbolo se recupera
         """
         disabled = []
         details = {}
@@ -231,34 +273,62 @@ class ContinuousLearningAgent:
         for sym, d in by_symbol.items():
             trades = d["trades"]
             pf = d["profit_factor"]
+            wr = d["win_rate_pct"]
 
+            # 🐛 B20.4: primero, ¿el símbolo estaba deshabilitado y ahora es rentable?
+            if sym in current_disabled:
+                prev = current_disabled[sym]
+                if trades >= REENABLE_MIN_TRADES and pf >= REENABLE_MIN_PF and wr >= REENABLE_MIN_WR:
+                    logger.info(
+                        f"✅ B20.4: {sym} RE-HABILITADO automáticamente "
+                        f"(PF={pf:.3f} ≥ {REENABLE_MIN_PF}, WR={wr:.1f}% ≥ {REENABLE_MIN_WR}%, "
+                        f"{trades} trades recientes)"
+                    )
+                    continue
+                else:
+                    disabled_until = prev.get("disabled_until", 0)
+                    if now_ts < disabled_until:
+                        disabled.append(sym)
+                        details[sym] = prev
+                        logger.debug(
+                            f"⏸️  B20: {sym} sigue deshabilitado hasta "
+                            f"{datetime.fromtimestamp(disabled_until, tz=TZ_MT5).strftime('%H:%M')}"
+                        )
+                        continue
+                    else:
+                        logger.info(f"⏰ B20: {sym} — deshabilitación expirada, reevaluando")
+
+            # Análisis normal de deshabilitación
             for level_name, cfg in DISABLE_THRESHOLDS.items():
-                if trades >= cfg["min_trades"] and pf < cfg["pf_max"]:
+                if trades < cfg["min_trades"]:
+                    continue
+
+                if pf < cfg["pf_max"] and wr < cfg["wr_max"]:
                     if cfg["disable_hours"] > 0:
                         disabled.append(sym)
                         details[sym] = {
                             "level": level_name,
                             "pf": pf,
+                            "wr": wr,
                             "trades": trades,
                             "disabled_at": int(now_ts),
                             "disabled_until": int(now_ts + cfg["disable_hours"] * 3600),
-                            "reason": f"PF={pf:.3f} < {cfg['pf_max']} con {trades} trades",
+                            "reason": f"PF={pf:.3f} < {cfg['pf_max']} Y WR={wr:.1f}% < {cfg['wr_max']}% ({trades} trades)",
                         }
                         logger.warning(
                             f"🚫 B20: {sym} DESHABILITADO por {cfg['disable_hours']}h "
-                            f"(PF={pf:.3f}, {trades} trades)"
+                            f"(PF={pf:.3f}, WR={wr:.1f}%, {trades} trades)"
                         )
                     else:
                         details[sym] = {
                             "level": level_name,
                             "pf": pf,
+                            "wr": wr,
                             "trades": trades,
-                            "reason": f"PF={pf:.3f} bajo ({trades} trades) — solo log",
+                            "reason": f"PF={pf:.3f} bajo Y WR={wr:.1f}% bajo — solo log",
                         }
-                        logger.info(
-                            f"📝 B20: {sym} PF={pf:.3f} bajo pero no crítico. Solo log."
-                        )
-                    break  # solo el nivel más severo aplica
+                        logger.info(f"📝 B20: {sym} PF={pf:.3f} WR={wr:.1f}% — solo log")
+                    break
 
         return disabled, details
 
@@ -270,10 +340,12 @@ class ContinuousLearningAgent:
         if not records:
             return self.load_current_config()
 
-        closures = [
+        closures_all = [
             r for r in records
             if r.get("category") == "CLOSURE" and r.get("pnl_usd") is not None
         ]
+
+        closures = self._filter_recent_closures(closures_all)
         total_trades = len(closures)
 
         if total_trades < self.MIN_TRADES_TO_OPTIMIZE:
@@ -292,26 +364,25 @@ class ContinuousLearningAgent:
         sum_losses = abs(sum((r.get("pnl_usd") or 0) for r in losses))
         profit_factor = (sum_wins / sum_losses) if sum_losses > 0 else (99.0 if sum_wins > 0 else 1.0)
 
-        by_symbol = self.analyze_by_symbol(closures)
+        by_symbol = self.analyze_by_symbol(closures_all)
         unprofitable_symbols = [
             s for s, d in by_symbol.items()
-            if d["trades"] >= 5 and d["profit_factor"] < 1.0
+            if d["trades"] >= 30 and d["profit_factor"] < 1.0
         ]
         if unprofitable_symbols:
             logger.warning(
                 f"⚠️ B18: Símbolos no rentables: {', '.join(unprofitable_symbols)}"
             )
 
-        # 🐛 B20: calcular símbolos a deshabilitar
-        disabled_symbols, disabled_details = self._compute_disabled_symbols(by_symbol)
-
+        # 🐛 B20: calcular símbolos a deshabilitar (con histéresis + re-habilitación)
         current_cfg = self.load_current_config()
+        current_disabled = current_cfg.get("disabled_details", {})
+        disabled_symbols, disabled_details = self._compute_disabled_symbols(by_symbol, current_disabled)
+
         min_confidence = current_cfg.get("min_confidence_threshold", DEFAULT_MIN_CONFIDENCE)
         atr_stop_mult = current_cfg.get("atr_stop_multiplier", 1.8)
         atr_profit_mult = current_cfg.get("atr_profit_multiplier", 3.0)
 
-        # 🐛 B19: límites globales más conservadores (los específicos por clase
-        # se aplican en signal_agent.py, no aquí)
         if profit_factor < 1.0:
             min_confidence = max(min_confidence, 92.0)
             atr_profit_mult = atr_profit_mult * 1.15
@@ -335,7 +406,7 @@ class ContinuousLearningAgent:
             atr_profit_mult = atr_profit_mult * 1.1
             logger.info(f"🚀 PF {profit_factor:.2f} > 2.0. Extendiendo TP.")
 
-        # Guardrails
+        # Guardrails de delta
         if self._last_min_confidence is not None:
             if abs(min_confidence - self._last_min_confidence) > self.MAX_CONFIDENCE_DELTA:
                 if min_confidence > self._last_min_confidence:
@@ -360,7 +431,13 @@ class ContinuousLearningAgent:
                     atr_profit_mult = self._last_atr_profit_mult - self.MAX_ATR_MULT_DELTA
                 logger.info(f"🔒 Delta TP limitado a ±{self.MAX_ATR_MULT_DELTA} → {atr_profit_mult:.2f}×")
 
+        # Clamps absolutos
         min_confidence = max(self.MIN_CONFIDENCE_FLOOR, min(self.MAX_CONFIDENCE_CEILING, min_confidence))
+
+        # 🐛 B23 CORREGIDO: clamp duro para ATR multipliers (evita acumulación infinita)
+        atr_stop_mult = max(1.0, min(6.0, atr_stop_mult))
+        atr_profit_mult = max(2.0, min(9.0, atr_profit_mult))
+
         min_confidence = round(min_confidence, 1)
         atr_stop_mult = round(atr_stop_mult, 2)
         atr_profit_mult = round(atr_profit_mult, 2)
@@ -380,11 +457,11 @@ class ContinuousLearningAgent:
             "atr_stop_multiplier": atr_stop_mult,
             "atr_profit_multiplier": atr_profit_mult,
             "unprofitable_symbols": unprofitable_symbols,
-            "disabled_symbols": disabled_symbols,          # 🆕 B20
-            "disabled_details": disabled_details,          # 🆕 B20
+            "disabled_symbols": disabled_symbols,
+            "disabled_details": disabled_details,
             "by_symbol": by_symbol,
             "guardrails_applied": True,
-            "learner_version": "1.4.0",
+            "learner_version": "1.5.1",
             "include_tests": self.include_tests,
         }
 
@@ -430,10 +507,6 @@ class ContinuousLearningAgent:
         }
 
     def is_symbol_disabled(self, symbol: str, config: Optional[dict] = None) -> bool:
-        """
-        🐛 B20: helper para que main.py consulte si un símbolo está deshabilitado.
-        Respeta la expiración temporal de disabled_details.
-        """
         if config is None:
             config = self.load_current_config()
 
@@ -444,7 +517,6 @@ class ContinuousLearningAgent:
         if symbol.upper() not in [s.upper() for s in disabled]:
             return False
 
-        # Verificar expiración
         details = config.get("disabled_details", {})
         sym_detail = details.get(symbol.upper(), {})
         disabled_until = sym_detail.get("disabled_until", 0)
@@ -464,15 +536,14 @@ if __name__ == "__main__":
     agent = ContinuousLearningAgent(include_tests=False)
     config = agent.analyze_and_optimize()
     print("\n" + "=" * 60)
-    print("📊 RESULTADO DE OPTIMIZACIÓN DEL AGENTE 5 (v1.4.0)")
+    print("📊 RESULTADO DE OPTIMIZACIÓN DEL AGENTE 5 (v1.5.1)")
     print("=" * 60)
     print(json.dumps(config, indent=2, default=str))
     print("=" * 60)
-    print(f"\n💡 Guardrails activos:")
-    print(f"   • Mínimo de trades: {ContinuousLearningAgent.MIN_TRADES_TO_OPTIMIZE}")
-    print(f"   • Delta máx. confianza: ±{ContinuousLearningAgent.MAX_CONFIDENCE_DELTA}")
-    print(f"   • Delta máx. ATR: ±{ContinuousLearningAgent.MAX_ATR_MULT_DELTA}")
-    print(f"   • Default min_confidence: {DEFAULT_MIN_CONFIDENCE}")
-    print(f"   • Include tests: {agent.include_tests}")
-    print(f"   • Umbrales disable: {DISABLE_THRESHOLDS}")
+    print(f"\n💡 Fixes aplicados:")
+    print(f"   • B20.1: min_trades_to_disable = {DISABLE_THRESHOLDS['critical']['min_trades']}")
+    print(f"   • B20.2: PF sobre últimos {PF_LOOKBACK_TRADES} trades")
+    print(f"   • B20.3: histéresis (PF bajo Y WR bajo)")
+    print(f"   • B20.4: re-habilitación si PF ≥ {REENABLE_MIN_PF} Y WR ≥ {REENABLE_MIN_WR}% Y ≥ {REENABLE_MIN_TRADES} trades")
+    print(f"   • B23:   clamp duro ATR (SL ∈ [1.0, 6.0], TP ∈ [2.0, 9.0])")
     print("=" * 60 + "\n")

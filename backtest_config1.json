@@ -1,0 +1,75 @@
+{
+  "datasets_dir": "datasets",
+  "symbols": ["XAUUSD", "XTIUSD", "XBRUSD", "XAGUSD", "BTCUSD", "ETHUSD", "SOLUSD", "US500"],
+  "initial_capital": 1750.0,
+
+  "start_date": null,
+  "end_date": null,
+  "start_date": "2026-09-17",
+  "end_date": "2026-09-25",
+
+  "versions": {
+    "sniper": {
+      "min_confidence": 90.0,
+      "atr_stop_multiplier_by_class": {
+        "XAU": 4.5, "XAG": 2.5, "OIL": 1.8, "US500": 2.0,
+        "BTC": 2.2, "ETH": 2.2, "SOL": 2.2, "FOREX": 1.2
+      },
+      "atr_profit_multiplier_by_class": {
+        "XAU": 7.0, "XAG": 4.0, "OIL": 3.0, "US500": 3.5,
+        "BTC": 3.8, "ETH": 3.8, "SOL": 3.8, "FOREX": 2.0
+      },
+      "use_m15_filter": false,
+      "disabled_symbols": [],
+      "max_concurrent_positions": 3,
+      "max_daily_trades": 20,
+      "cooldown_seconds": 60,
+      "stop_loss_cuarentena_seconds": 300,
+      "max_allowed_spread_bps": 15.0,
+      "crypto_offhours_max_spread_bps": 20.0,
+      "daily_drawdown_limit_pct": 3.0
+    },
+
+    "multipy": {
+      "min_confidence": 90.0,
+      "atr_stop_multiplier_by_class": {
+        "XAU": 4.5, "XAG": 2.5, "OIL": 1.8, "US500": 2.0,
+        "BTC": 2.2, "ETH": 2.2, "SOL": 2.2, "FOREX": 1.2
+      },
+      "atr_profit_multiplier_by_class": {
+        "XAU": 7.0, "XAG": 4.0, "OIL": 3.0, "US500": 3.5,
+        "BTC": 3.8, "ETH": 3.8, "SOL": 3.8, "FOREX": 2.0
+      },
+      "use_m15_filter": true,
+      "disabled_symbols": [],
+      "max_concurrent_positions": 3,
+      "max_daily_trades": 20,
+      "cooldown_seconds": 60,
+      "stop_loss_cuarentena_seconds": 300,
+      "max_allowed_spread_bps": 15.0,
+      "crypto_offhours_max_spread_bps": 20.0,
+      "daily_drawdown_limit_pct": 3.0
+    },
+
+    "fixes": {
+      "min_confidence": 92.0,
+      "atr_stop_multiplier_by_class": {
+        "XAU": 4.5, "XAG": 2.5, "OIL": 2.2, "US500": 3.0,
+        "BTC": 2.5, "ETH": 2.5, "SOL": 2.5, "FOREX": 1.2
+      },
+      "atr_profit_multiplier_by_class": {
+        "XAU": 7.0, "XAG": 4.0, "OIL": 3.45, "US500": 4.5,
+        "BTC": 3.45, "ETH": 3.45, "SOL": 3.45, "FOREX": 2.0
+      },
+      "use_m15_filter": true,
+      "disabled_symbols": ["XAGUSD", "ETHUSD", "SOLUSD"],
+      "max_concurrent_positions": 3,
+      "max_daily_trades": 20,
+      "cooldown_seconds": 60,
+      "stop_loss_cuarentena_seconds": 300,
+      "max_allowed_spread_bps": 15.0,
+      "crypto_offhours_max_spread_bps": 20.0,
+      "daily_drawdown_limit_pct": 3.0
+    }
+  }
+}

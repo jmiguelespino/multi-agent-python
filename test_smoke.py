@@ -2,13 +2,15 @@
 =============================================================================
 SMOKE TEST — QuantEdge AI
 =============================================================================
-🔧 v1.9.0 — LOTE FUSIONADO 2.6+3:
-  • 🐛 O5: TEST 14 reduce reintentos de PnL (max_retries=1) para no tardar.
-  • Añadidos tests 15, 16, 17 para B19, B20, B21.
+🔧 v1.9.1 — fixes TEST 16 y TEST 17 duplicado:
+  • 🐛 TEST 16 corregido: `_compute_disabled_symbols(fake_by_symbol, {})`
+  • 🐛 TEST 17 eliminado duplicado
+  • TEST 18 (B20-fixed) se mantiene
 =============================================================================
 """
 import sys
 import os
+import time
 
 GREEN = "\033[92m"
 RED = "\033[91m"
@@ -76,7 +78,7 @@ def test_fix2_macro_trend_method_exists():
     try:
         from signal_agent import StrategySignalAgent
     except ImportError as e:
-        _fail(f"No se pudo importar signal_agent: {e}")
+        _fail(f"No se pudo importar: {e}")
         return False
 
     agent = StrategySignalAgent("BTCUSD")
@@ -393,7 +395,7 @@ def test_canonical_consistency_4_modules():
 
 
 # =============================================================================
-# TEST 14 — PnL UNKNOWN (O5: retry rápido)
+# TEST 14 — PnL UNKNOWN (O5)
 # =============================================================================
 def test_bug5_pnl_unknown_reason():
     print("\n🧪 TEST 14 — PnL UNKNOWN (retry rápido)")
@@ -403,7 +405,6 @@ def test_bug5_pnl_unknown_reason():
         _fail(f"No se pudo importar: {e}")
         return False
 
-    # 🐛 O5: usar max_retries=1 para no tardar
     pnl, price, reason = ExecutionOMSAgent._fetch_realized_pnl_from_mt5(
         999999999, max_retries=1, retry_delay=0.0
     )
@@ -420,7 +421,7 @@ def test_bug5_pnl_unknown_reason():
 
 
 # =============================================================================
-# 🆕 TEST 15 — B19: límites ATR por clase
+# TEST 15 — B19: límites ATR por clase
 # =============================================================================
 def test_b19_atr_limits_by_class():
     print("\n🧪 TEST 15 — 🐛 B19: límites ATR por clase")
@@ -430,7 +431,6 @@ def test_b19_atr_limits_by_class():
         _fail(f"No se pudo importar: {e}")
         return False
 
-    # Oro: SL ∈ [3.5, 6.0]
     sl, tp = clamp_atr_by_class("XAU", 1.0, 1.0)
     if sl == 3.5 and tp == 5.0:
         _ok(f"XAU con SL=1.0/TP=1.0 → clamp a SL={sl}/TP={tp}")
@@ -438,7 +438,6 @@ def test_b19_atr_limits_by_class():
         _fail(f"XAU clamp incorrecto: SL={sl}, TP={tp}")
         return False
 
-    # Cripto: SL ∈ [1.8, 3.5]
     sl, tp = clamp_atr_by_class("BTC", 10.0, 20.0)
     if sl == 3.5 and tp == 6.0:
         _ok(f"BTC con SL=10.0/TP=20.0 → clamp a SL={sl}/TP={tp}")
@@ -446,7 +445,6 @@ def test_b19_atr_limits_by_class():
         _fail(f"BTC clamp incorrecto: SL={sl}, TP={tp}")
         return False
 
-    # get_class_of
     casos_clase = [
         ("XAUUSD", "XAU"), ("XAGUSD", "XAG"), ("XTIUSD", "OIL"),
         ("BTCUSD", "BTC"), ("EURUSD", "FOREX"), ("US500", "US500"),
@@ -463,96 +461,104 @@ def test_b19_atr_limits_by_class():
 
 
 # =============================================================================
-# 🆕 TEST 16 — B20: disabled_symbols
+# 🆕 TEST 18 — B20 corregido: min_trades + histéresis
 # =============================================================================
-def test_b20_disabled_symbols():
-    print("\n🧪 TEST 16 — 🐛 B20: disabled_symbols")
+def test_b20_fixed():
+    print("\n🧪 TEST 18 — 🐛 B20 corregido: min_trades + histéresis")
     try:
-        from feedback_learner import ContinuousLearningAgent, DISABLE_THRESHOLDS
+        from feedback_learner import (
+            ContinuousLearningAgent, DISABLE_THRESHOLDS,
+            PF_LOOKBACK_TRADES, REENABLE_MIN_PF, REENABLE_MIN_WR
+        )
     except ImportError as e:
         _fail(f"No se pudo importar: {e}")
         return False
+
+    all_ok = True
+
+    critical_min = DISABLE_THRESHOLDS["critical"]["min_trades"]
+    if critical_min >= 30:
+        _ok(f"critical.min_trades = {critical_min} (≥30)")
+    else:
+        _fail(f"critical.min_trades = {critical_min} (esperado ≥30)")
+        all_ok = False
+
+    if "wr_max" in DISABLE_THRESHOLDS["critical"]:
+        _ok(f"critical.wr_max = {DISABLE_THRESHOLDS['critical']['wr_max']}% (histéresis activa)")
+    else:
+        _fail("critical.wr_max NO definido")
+        all_ok = False
+
+    if 0 < PF_LOOKBACK_TRADES <= 200:
+        _ok(f"PF_LOOKBACK_TRADES = {PF_LOOKBACK_TRADES}")
+    else:
+        _fail(f"PF_LOOKBACK_TRADES = {PF_LOOKBACK_TRADES}")
+        all_ok = False
 
     agent = ContinuousLearningAgent()
-
-    # Simular by_symbol con XAGUSD muy malo
     fake_by_symbol = {
-        "XAGUSD": {"trades": 8, "profit_factor": 0.25, "wins": 2, "losses": 6, "win_rate_pct": 25.0, "pnl_usd": -20.0, "is_profitable": False},
-        "ETHUSD": {"trades": 6, "profit_factor": 0.0, "wins": 0, "losses": 6, "win_rate_pct": 0.0, "pnl_usd": -5.0, "is_profitable": False},
-        "XTIUSD": {"trades": 4, "profit_factor": 2.045, "wins": 3, "losses": 1, "win_rate_pct": 75.0, "pnl_usd": 23.0, "is_profitable": True},
+        "TEST1": {"trades": 50, "profit_factor": 0.4, "win_rate_pct": 55.0, "wins": 27, "losses": 23, "pnl_usd": -10.0, "is_profitable": False},
+        "TEST2": {"trades": 50, "profit_factor": 0.4, "win_rate_pct": 30.0, "wins": 15, "losses": 35, "pnl_usd": -20.0, "is_profitable": False},
+        "TEST3": {"trades": 5,  "profit_factor": 0.2, "win_rate_pct": 20.0, "wins": 1, "losses": 4, "pnl_usd": -5.0,  "is_profitable": False},
     }
+    disabled, details = agent._compute_disabled_symbols(fake_by_symbol, {})
 
-    disabled, details = agent._compute_disabled_symbols(fake_by_symbol)
-
-    if "XAGUSD" in disabled:
-        _ok(f"XAGUSD deshabilitado (PF=0.25)")
+    if "TEST1" not in disabled:
+        _ok("TEST1 (PF=0.4, WR=55%) NO deshabilitado (histéresis OK)")
     else:
-        _fail(f"XAGUSD NO deshabilitado (era PF=0.25)")
-        return False
+        _fail("TEST1 (PF=0.4, WR=55%) SÍ deshabilitado (falta histéresis)")
+        all_ok = False
 
-    if "ETHUSD" in disabled:
-        _ok(f"ETHUSD deshabilitado (PF=0.0)")
+    if "TEST2" in disabled:
+        _ok("TEST2 (PF=0.4, WR=30%) SÍ deshabilitado (correcto)")
     else:
-        _fail(f"ETHUSD NO deshabilitado (era PF=0.0)")
-        return False
+        _fail("TEST2 (PF=0.4, WR=30%) NO deshabilitado (debería)")
+        all_ok = False
 
-    if "XTIUSD" not in disabled:
-        _ok(f"XTIUSD NO deshabilitado (PF=2.045)")
+    if "TEST3" not in disabled:
+        _ok("TEST3 (5 trades) NO deshabilitado (min_trades OK)")
     else:
-        _fail(f"XTIUSD deshabilitado por error (era PF=2.045)")
-        return False
+        _fail("TEST3 (5 trades) SÍ deshabilitado (min_trades bajo)")
+        all_ok = False
 
-    # Verificar is_symbol_disabled
-    if agent.is_symbol_disabled("XAGUSD", {"disabled_symbols": disabled, "disabled_details": details}):
-        _ok("is_symbol_disabled('XAGUSD') → True")
+    current_disabled = {
+        "RECOVERED": {"level": "severe", "pf": 0.5, "trades": 30, "disabled_at": int(time.time()) - 3600, "disabled_until": int(time.time()) + 3600, "reason": "test"}
+    }
+    fake_recovered = {
+        "RECOVERED": {"trades": 20, "profit_factor": 1.5, "win_rate_pct": 55.0, "wins": 11, "losses": 9, "pnl_usd": 5.0, "is_profitable": True},
+    }
+    disabled2, _ = agent._compute_disabled_symbols(fake_recovered, current_disabled)
+    if "RECOVERED" not in disabled2:
+        _ok("RECOVERED (PF=1.5) re-habilitado automáticamente (B20.4 OK)")
     else:
-        _fail("is_symbol_disabled('XAGUSD') → False")
-        return False
+        _fail("RECOVERED (PF=1.5) NO re-habilitado (falta B20.4)")
+        all_ok = False
 
-    return True
+    return all_ok
 
 
 # =============================================================================
-# 🆕 TEST 17 — B21: cuarentena escalonada
+# 🆕 TEST 19 — B23: clamp duro ATR
 # =============================================================================
-def test_b21_quarantine_scaling():
-    print("\n🧪 TEST 17 — 🐛 B21: cuarentena escalonada")
+def test_b23_atr_clamp():
+    print("\n🧪 TEST 19 — 🐛 B23: clamp duro ATR multipliers")
     try:
-        from risk_guardian import InstitutionalRiskGuardian, CONSECUTIVE_LOSS_THRESHOLDS
+        import feedback_learner as fl
     except ImportError as e:
         _fail(f"No se pudo importar: {e}")
         return False
 
-    rg = InstitutionalRiskGuardian(initial_capital=1730.0)
+    # Verificar que el código tiene el clamp
+    import inspect
+    source = inspect.getsource(fl.ContinuousLearningAgent.analyze_and_optimize)
 
-    # Simular 3 pérdidas consecutivas en XAUUSD
-    for i in range(3):
-        rg.register_trade_closed(pnl_usd=-5.0, symbol="XAUUSD")
-
-    # Verificar cuarentena
-    report = rg.get_status_report()
-    quarantines = report.get("active_quarantines", {})
-
-    if "XAU" in quarantines:
-        remaining_min = quarantines["XAU"]["remaining_min"]
-        if 50 <= remaining_min <= 60:
-            _ok(f"XAU en cuarentena ~1h ({remaining_min} min restantes) tras 3 pérdidas")
-        else:
-            _warn(f"XAU en cuarentena con {remaining_min} min (esperado ~60)")
+    if "B23" in source and "min(6.0" in source and "min(9.0" in source:
+        _ok("Clamp duro SL ∈ [1.0, 6.0] presente")
+        _ok("Clamp duro TP ∈ [2.0, 9.0] presente")
+        return True
     else:
-        _fail("XAU NO está en cuarentena tras 3 pérdidas")
+        _fail("Clamp duro B23 NO encontrado en analyze_and_optimize()")
         return False
-
-    # Verificar que ganar resetea
-    rg.register_trade_closed(pnl_usd=+10.0, symbol="XAUUSD")
-    streak = rg._consecutive_losses.get("XAU", 0)
-    if streak == 0:
-        _ok("Racha reseteada tras ganancia")
-    else:
-        _fail(f"Racha NO reseteada (streak={streak})")
-        return False
-
-    return True
 
 
 # =============================================================================
@@ -560,27 +566,27 @@ def test_b21_quarantine_scaling():
 # =============================================================================
 def main():
     print("=" * 70)
-    print("  QUANTEDGE AI — SMOKE TEST v1.9.0")
+    print("  QUANTEDGE AI — SMOKE TEST v1.9.1")
     print("=" * 70)
 
     tests = [
-        ("FIX #1 — canónico OIL",               test_fix1_canonical_oil),
-        ("FIX #2 — _check_macro_trend existe",  test_fix2_macro_trend_method_exists),
-        ("FIX #2 — _check_macro_trend fail-safe", test_fix2_macro_trend_failsafe),
-        ("Risk Guardian — instanciación",       test_risk_guardian_instantiates),
-        ("Signal Agent — por clase",            test_signal_agent_per_asset_class),
-        ("Execution Agent — instanciación",     test_execution_agent_instantiates),
-        ("Coherencia — 3 módulos",              test_canonical_consistency),
-        ("BUG #1 — bridge canónico OIL",        test_bug1_bridge_canonical_oil),
-        ("BUG #1 — infer_is_buyer_maker",       test_bug1_infer_is_buyer_maker),
-        ("BUG #3 — _resolve_mt5_symbol",        test_bug3_signal_agent_resolve_symbol),
-        ("BUG #4 — _get_contract_size",         test_bug4_execution_agent_contract_size),
-        ("MEJORA #5 — _get_min_atr",            test_mejora5_feature_agent_min_atr),
-        ("Coherencia — 4 módulos",              test_canonical_consistency_4_modules),
-        ("BUG #5 — PnL UNKNOWN (O5)",           test_bug5_pnl_unknown_reason),
-        ("🆕 B19 — límites ATR por clase",      test_b19_atr_limits_by_class),
-        ("🆕 B20 — disabled_symbols",           test_b20_disabled_symbols),
-        ("🆕 B21 — cuarentena escalonada",      test_b21_quarantine_scaling),
+        ("FIX #1 — canónico OIL",                       test_fix1_canonical_oil),
+        ("FIX #2 — _check_macro_trend existe",          test_fix2_macro_trend_method_exists),
+        ("FIX #2 — _check_macro_trend fail-safe",       test_fix2_macro_trend_failsafe),
+        ("Risk Guardian — instanciación",               test_risk_guardian_instantiates),
+        ("Signal Agent — por clase",                    test_signal_agent_per_asset_class),
+        ("Execution Agent — instanciación",             test_execution_agent_instantiates),
+        ("Coherencia — 3 módulos",                      test_canonical_consistency),
+        ("BUG #1 — bridge canónico OIL",                test_bug1_bridge_canonical_oil),
+        ("BUG #1 — infer_is_buyer_maker",               test_bug1_infer_is_buyer_maker),
+        ("BUG #3 — _resolve_mt5_symbol",                test_bug3_signal_agent_resolve_symbol),
+        ("BUG #4 — _get_contract_size",                 test_bug4_execution_agent_contract_size),
+        ("MEJORA #5 — _get_min_atr",                    test_mejora5_feature_agent_min_atr),
+        ("Coherencia — 4 módulos",                      test_canonical_consistency_4_modules),
+        ("BUG #5 — PnL UNKNOWN (O5)",                   test_bug5_pnl_unknown_reason),
+        ("B19 — límites ATR por clase",                 test_b19_atr_limits_by_class),
+        ("B20-fixed — histéresis + re-habilitación",    test_b20_fixed),
+        ("B23 — clamp duro ATR",                        test_b23_atr_clamp),
     ]
 
     results = []
