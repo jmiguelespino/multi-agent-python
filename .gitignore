@@ -1,0 +1,28 @@
+
+# variables de entorno (¡CRÍTICO! Bloquea tus claves de API)
+
+.env
+*.env
+
+# Archivos de caché de Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Historial local, logs de debates y base de datos local
+# cooldown_tracker.json
+# balance_inicial_diario.json
+# debates.json
+# debates_log.md
+# historical_trades.csv
+
+# Gráficos y reportes pesados generados por el backtest
+*.png
+# *.txt
+*.csv
+
+# Carpetas virtuales de Python (si usas venv)
+venv/
+.venv/.env 
+logs/ 

@@ -1,0 +1,453 @@
+"""
+MÓDULO DE EJECUCIÓN INSTITUCIONAL Y OMS (AGENTE 4)
+
+🔧 v1.2:
+  • _update_mt5_sl valida SL contra el precio actual antes de enviar.
+  • Auto-ajuste del SL para respetar stops_level del broker.
+  • Warning de "Invalid stops" solo 1 vez por ticket.
+  • PnL real desde MT5.
+  • log_position_closed correctamente llamado.
+  • logger.propagate = False.
+🔧 v1.3:
+  • FIX #1: WTI y BRENT unificados como "OIL" en get_canonical_asset().
+  • Añadido soporte para XAG (Plata) y US500 (S&P 500) en canónico.
+"""
+import os
+import asyncio
+import logging
+import time
+from dataclasses import dataclass
+from enum import Enum
+from typing import Dict, Optional, List, Any
+import MetaTrader5 as mt5
+from dotenv import load_dotenv
+
+from audit_logger import (
+    log_order_filled,
+    log_break_even,
+    log_trailing_stop,
+    log_position_closed,
+    log_audit_event
+)
+
+load_dotenv()
+logger = logging.getLogger("ExecutionOMS")
+logger.propagate = False
+
+
+def get_canonical_asset(symbol: str) -> str:
+    """
+    🔧 v1.3: WTI y BRENT devuelven "OIL" para unificar exposición.
+    Consistente con risk_guardian.get_canonical_asset().
+    """
+    if not symbol:
+        return ""
+    s = symbol.upper().replace(".RAW", "").replace("_RAW", "").strip()
+    if "BTC" in s or "BITCOIN" in s:
+        return "BTC"
+    if "ETH" in s or "ETHEREUM" in s:
+        return "ETH"
+    if "SOL" in s or "SOLANA" in s:
+        return "SOL"
+    if "XAU" in s or "GOLD" in s or "ORO" in s:
+        return "XAU"
+    if "XAG" in s or "SILVER" in s or "PLATA" in s:
+        return "XAG"
+    # 🔧 FIX #1: WTI y BRENT → "OIL" (mismo activo subyacente)
+    if "WTI" in s or "XTI" in s or "USO" in s or "CRUDE" in s or "OIL" in s or "PETROLEO" in s:
+        return "OIL"
+    if "BRENT" in s or "XBR" in s or "UKO" in s:
+        return "OIL"
+    if "US500" in s or "SP500" in s or "SPX" in s:
+        return "US500"
+    if "EUR" in s:
+        return "EURUSD"
+    if "GBP" in s:
+        return "GBPUSD"
+    return s
+
+
+class OrderStatus(str, Enum):
+    PENDING = "PENDING"
+    FILLED = "FILLED"
+    CANCELED = "CANCELED"
+    REJECTED = "REJECTED"
+
+
+@dataclass
+class BracketOrder:
+    order_id: str
+    symbol: str
+    side: str
+    quantity: float
+    entry_price: float
+    stop_loss: float
+    take_profit: float
+    break_even_activated: bool = False
+    trailing_stop_active: bool = False
+    trailing_stop_price: Optional[float] = None
+    status: OrderStatus = OrderStatus.PENDING
+    slippage_usd: float = 0.0
+    commission_usd: float = 0.0
+    entry_timestamp: float = 0.0
+    pnl_usd: float = 0.0
+    close_price: float = 0.0
+
+
+class ExecutionOMSAgent:
+    def __init__(self, taker_fee_pct: float = 0.0004, maker_fee_pct: float = 0.0002):
+        self.taker_fee_pct = taker_fee_pct
+        self.maker_fee_pct = maker_fee_pct
+        self.active_orders: Dict[str, BracketOrder] = {}
+        self.closed_orders: List[BracketOrder] = []
+        self._reported_tickets: set = set()
+
+        # 🔧 v1.2: set de tickets cuyo warning de SL ya se mostró
+        self._sl_warning_shown: set = set()
+
+        self.be_trigger_atr = float(os.getenv("BREAK_EVEN_ATR_TRIGGER", "1.2"))
+        self.be_lock_atr = float(os.getenv("BREAK_EVEN_LOCK_ATR", "0.10"))
+        self.trail_trigger_atr = float(os.getenv("TRAILING_STOP_ATR_TRIGGER", "2.0"))
+        self.trail_dist_atr = float(os.getenv("TRAILING_STOP_ATR_DISTANCE", "1.8"))
+        self.magic_number = int(os.getenv("MAGIC_NUMBER", "992026"))
+
+    @staticmethod
+    def _fetch_realized_pnl_from_mt5(ticket: int) -> tuple[float, float, str]:
+        """Obtiene el PnL real de un ticket cerrado desde el historial de MT5."""
+        try:
+            from datetime import datetime, timedelta, timezone as _tz
+            tz_mt5 = _tz(timedelta(hours=3))
+            from_date = datetime.now(tz_mt5) - timedelta(days=7)
+            to_date = datetime.now(tz_mt5) + timedelta(days=1)
+
+            deals = mt5.history_deals_get(from_date, to_date, position=ticket)
+            if not deals:
+                deals = mt5.history_deals_get(from_date, to_date)
+
+            if not deals:
+                return 0.0, 0.0, "MANUAL_CLOSE"
+
+            total_profit = 0.0
+            total_commission = 0.0
+            total_swap = 0.0
+            close_price = 0.0
+            reason = "MANUAL_CLOSE"
+
+            for d in deals:
+                pid = getattr(d, "position_id", None) or getattr(d, "position", None)
+                if pid == ticket:
+                    total_profit += getattr(d, "profit", 0.0)
+                    total_commission += getattr(d, "commission", 0.0)
+                    total_swap += getattr(d, "swap", 0.0)
+                    if getattr(d, "entry", None) == mt5.DEAL_ENTRY_OUT:
+                        close_price = d.price
+                        comment = (d.comment or "").lower()
+                        if "tp" in comment or "take" in comment:
+                            reason = "TAKE_PROFIT"
+                        elif "sl" in comment or "stop" in comment:
+                            reason = "STOP_LOSS"
+                        elif "trail" in comment:
+                            reason = "TRAILING_STOP"
+
+            total_pnl = total_profit + total_commission + total_swap
+            return round(total_pnl, 2), close_price, reason
+        except Exception as e:
+            logger.error(f"Error obteniendo PnL real del ticket #{ticket}: {e}")
+            return 0.0, 0.0, "MANUAL_CLOSE"
+
+    def sync_mt5_positions(self, raw_positions, risk_guardian: Optional[Any] = None):
+        if raw_positions is None:
+            raw_positions = []
+
+        current_tickets = {str(p.ticket) for p in raw_positions}
+
+        for p in raw_positions:
+            order_key = str(p.ticket)
+            side = "BUY" if p.type == mt5.ORDER_TYPE_BUY else "SELL"
+
+            if order_key not in self.active_orders:
+                entry_time = (p.time_msc / 1000.0) if hasattr(p, 'time_msc') and p.time_msc else time.time()
+                order = BracketOrder(
+                    order_id=order_key,
+                    symbol=p.symbol,
+                    side=side,
+                    quantity=p.volume,
+                    entry_price=p.price_open,
+                    stop_loss=p.sl,
+                    take_profit=p.tp,
+                    status=OrderStatus.FILLED,
+                    entry_timestamp=entry_time
+                )
+                self.active_orders[order_key] = order
+
+            if order_key not in self._reported_tickets:
+                self._reported_tickets.add(order_key)
+                log_audit_event(
+                    event_type="OPEN_POSITION_DETECTED",
+                    category="ORDER",
+                    symbol=p.symbol,
+                    reason="Posición abierta detectada en MT5 y vinculada al motor de blindaje OMS.",
+                    details=f"Ticket #{p.ticket} | {side} {p.volume} {p.symbol} @ ${p.price_open:.2f} | PnL Flotante: ${p.profit:,.2f} USD",
+                    side=side,
+                    price=p.price_open,
+                    volume=p.volume,
+                    stop_loss=p.sl,
+                    take_profit=p.tp,
+                    ticket=p.ticket,
+                    order_id=order_key
+                )
+
+        for order_id in list(self.active_orders.keys()):
+            if order_id.isdigit() and order_id not in current_tickets:
+                closed_order = self.active_orders.pop(order_id)
+                ticket_int = int(order_id)
+
+                pnl_usd, close_price, close_reason = self._fetch_realized_pnl_from_mt5(ticket_int)
+                closed_order.pnl_usd = pnl_usd
+                closed_order.close_price = close_price
+                closed_order.status = OrderStatus.CANCELED
+                self.closed_orders.append(closed_order)
+
+                if order_id in self._reported_tickets:
+                    self._reported_tickets.remove(order_id)
+
+                if risk_guardian:
+                    risk_guardian.register_trade_closed(pnl_usd=pnl_usd, symbol=closed_order.symbol)
+
+                duration_sec = int(time.time() - closed_order.entry_timestamp) if closed_order.entry_timestamp else 0
+                pnl_percent = (pnl_usd / (closed_order.entry_price * closed_order.quantity * 100.0)) * 100.0 if closed_order.entry_price > 0 else 0.0
+                log_position_closed(
+                    symbol=closed_order.symbol,
+                    side=closed_order.side,
+                    volume=closed_order.quantity,
+                    entry_price=closed_order.entry_price,
+                    exit_price=close_price,
+                    pnl_usd=pnl_usd,
+                    pnl_percent=round(pnl_percent, 2),
+                    reason=close_reason,
+                    ticket=ticket_int,
+                    order_id=order_id,
+                    duration_sec=duration_sec
+                )
+                logger.info(f"📉 Posición cerrada #{ticket_int} {closed_order.symbol} | PnL: ${pnl_usd:.2f} | Razón: {close_reason}")
+
+    def _update_mt5_sl(self, ticket_id: str, symbol: str, new_sl: float, current_tp: float):
+        """
+        🔧 v1.2: Valida SL contra el precio actual antes de enviar.
+        Auto-ajusta si es necesario para respetar stops_level.
+        Warning solo 1 vez por ticket.
+        """
+        if not ticket_id.isdigit():
+            return
+
+        try:
+            ticket = int(ticket_id)
+
+            # 🔧 Validar contra el precio actual de la posición
+            positions = mt5.positions_get(ticket=ticket)
+            if not positions:
+                return
+
+            pos = positions[0]
+            tick = mt5.symbol_info_tick(symbol)
+            info = mt5.symbol_info(symbol)
+
+            if not tick or not info:
+                return
+
+            # Distancia mínima permitida (stops_level o colchón)
+            stops_level = (
+                getattr(info, "stops_level", None)
+                or getattr(info, "trade_stops_level", None)
+                or 0
+            )
+            min_distance = max(stops_level * info.point, info.point * 50)
+
+            # Validar coherencia: SL debe estar al lado correcto del precio
+            if pos.type == mt5.ORDER_TYPE_BUY:
+                # BUY: SL debe estar por DEBAJO del bid actual
+                if new_sl >= tick.bid - min_distance:
+                    adjusted_sl = round(tick.bid - min_distance, info.digits)
+                    logger.debug(
+                        f"SL ajustado para ticket #{ticket}: {new_sl} → {adjusted_sl} "
+                        f"(bid={tick.bid}, min_dist={min_distance:.5f})"
+                    )
+                    new_sl = adjusted_sl
+            else:
+                # SELL: SL debe estar por ENCIMA del ask actual
+                if new_sl <= tick.ask + min_distance:
+                    adjusted_sl = round(tick.ask + min_distance, info.digits)
+                    logger.debug(
+                        f"SL ajustado para ticket #{ticket}: {new_sl} → {adjusted_sl} "
+                        f"(ask={tick.ask}, min_dist={min_distance:.5f})"
+                    )
+                    new_sl = adjusted_sl
+
+            req = {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "position": ticket,
+                "symbol": symbol,
+                "sl": new_sl,
+                "tp": current_tp,
+            }
+            res = mt5.order_send(req)
+
+            if not (res and res.retcode == mt5.TRADE_RETCODE_DONE):
+                comment = res.comment if res else "Error de envío"
+                # 🔧 Solo mostrar warning 1 vez por ticket
+                if ticket not in self._sl_warning_shown:
+                    logger.warning(f"⚠️ No se pudo modificar SL (Ticket #{ticket}): {comment}")
+                    self._sl_warning_shown.add(ticket)
+        except Exception as e:
+            logger.error(f"Error modificando SL en MT5: {e}")
+
+    async def place_bracket_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        current_market_price: float,
+        stop_loss: float,
+        take_profit: float
+    ) -> BracketOrder:
+        order_id = f"SNIPER-{int(time.time()*1000)}"
+        slippage_bps = 0.4 + (quantity * 0.05)
+        slippage_factor = slippage_bps / 10000.0
+
+        fill_price = current_market_price * (1.0 + slippage_factor) if side == "BUY" else current_market_price * (1.0 - slippage_factor)
+        fill_price = round(fill_price, 2)
+
+        commission = round(quantity * fill_price * self.taker_fee_pct, 2)
+        slippage_usd = round(abs(fill_price - current_market_price) * quantity, 2)
+
+        order = BracketOrder(
+            order_id=order_id,
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            entry_price=fill_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            status=OrderStatus.FILLED,
+            slippage_usd=slippage_usd,
+            commission_usd=commission,
+            entry_timestamp=time.time()
+        )
+
+        self.active_orders[order_id] = order
+        log_order_filled(
+            symbol=symbol,
+            side=side,
+            volume=quantity,
+            fill_price=fill_price,
+            sl=stop_loss,
+            tp=take_profit,
+            order_id=order_id,
+            metadata={"commission_usd": commission, "slippage_usd": slippage_usd}
+        )
+        return order
+
+    def update_tick_price(self, order_id: str, tick_symbol: str, current_price: float, atr: float) -> Optional[str]:
+        if order_id not in self.active_orders:
+            return None
+
+        order = self.active_orders[order_id]
+
+        if order.symbol != tick_symbol and get_canonical_asset(order.symbol) != get_canonical_asset(tick_symbol):
+            return None
+
+        if order.side == "BUY":
+            # Break-Even
+            if not order.break_even_activated and current_price >= order.entry_price + (atr * self.be_trigger_atr):
+                old_sl = order.stop_loss
+                be_price = round(order.entry_price + (atr * self.be_lock_atr), 2)
+                if order.stop_loss < be_price:
+                    order.stop_loss = be_price
+                    order.break_even_activated = True
+                    self._update_mt5_sl(order_id, order.symbol, be_price, order.take_profit)
+                    log_break_even(
+                        symbol=order.symbol,
+                        ticket=int(order_id) if order_id.isdigit() else None,
+                        old_sl=old_sl,
+                        new_sl=order.stop_loss,
+                        current_price=current_price,
+                        profit_locked_usd=round((be_price - order.entry_price) * order.quantity, 2),
+                        order_id=order_id
+                    )
+
+            # Trailing Stop
+            if not order.trailing_stop_active and current_price >= order.entry_price + (atr * self.trail_trigger_atr):
+                order.trailing_stop_active = True
+                order.trailing_stop_price = round(current_price - (atr * self.trail_dist_atr), 2)
+                self._update_mt5_sl(order_id, order.symbol, order.trailing_stop_price, order.take_profit)
+                log_trailing_stop(
+                    symbol=order.symbol,
+                    ticket=int(order_id) if order_id.isdigit() else None,
+                    old_sl=order.stop_loss,
+                    new_sl=order.trailing_stop_price,
+                    current_price=current_price,
+                    order_id=order_id
+                )
+            elif order.trailing_stop_active and order.trailing_stop_price:
+                new_trail = round(current_price - (atr * self.trail_dist_atr), 2)
+                if new_trail > order.trailing_stop_price:
+                    old_trail = order.trailing_stop_price
+                    order.trailing_stop_price = new_trail
+                    self._update_mt5_sl(order_id, order.symbol, new_trail, order.take_profit)
+                    log_trailing_stop(
+                        symbol=order.symbol,
+                        ticket=int(order_id) if order_id.isdigit() else None,
+                        old_sl=old_trail,
+                        new_sl=new_trail,
+                        current_price=current_price,
+                        order_id=order_id
+                    )
+
+        elif order.side == "SELL":
+            # Break-Even
+            if not order.break_even_activated and current_price <= order.entry_price - (atr * self.be_trigger_atr):
+                old_sl = order.stop_loss
+                be_price = round(order.entry_price - (atr * self.be_lock_atr), 2)
+                if order.stop_loss == 0 or order.stop_loss > be_price:
+                    order.stop_loss = be_price
+                    order.break_even_activated = True
+                    self._update_mt5_sl(order_id, order.symbol, be_price, order.take_profit)
+                    log_break_even(
+                        symbol=order.symbol,
+                        ticket=int(order_id) if order_id.isdigit() else None,
+                        old_sl=old_sl,
+                        new_sl=order.stop_loss,
+                        current_price=current_price,
+                        profit_locked_usd=round((order.entry_price - be_price) * order.quantity, 2),
+                        order_id=order_id
+                    )
+
+            # Trailing Stop
+            if not order.trailing_stop_active and current_price <= order.entry_price - (atr * self.trail_trigger_atr):
+                order.trailing_stop_active = True
+                order.trailing_stop_price = round(current_price + (atr * self.trail_dist_atr), 2)
+                self._update_mt5_sl(order_id, order.symbol, order.trailing_stop_price, order.take_profit)
+                log_trailing_stop(
+                    symbol=order.symbol,
+                    ticket=int(order_id) if order_id.isdigit() else None,
+                    old_sl=order.stop_loss,
+                    new_sl=order.trailing_stop_price,
+                    current_price=current_price,
+                    order_id=order_id
+                )
+            elif order.trailing_stop_active and order.trailing_stop_price:
+                new_trail = round(current_price + (atr * self.trail_dist_atr), 2)
+                if new_trail < order.trailing_stop_price:
+                    old_trail = order.trailing_stop_price
+                    order.trailing_stop_price = new_trail
+                    self._update_mt5_sl(order_id, order.symbol, new_trail, order.take_profit)
+                    log_trailing_stop(
+                        symbol=order.symbol,
+                        ticket=int(order_id) if order_id.isdigit() else None,
+                        old_sl=old_trail,
+                        new_sl=new_trail,
+                        current_price=current_price,
+                        order_id=order_id
+                    )
+
+        return None
