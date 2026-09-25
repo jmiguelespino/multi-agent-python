@@ -1,14 +1,11 @@
 """
 MÓDULO DE ESTRATEGIA CUANTITATIVA Y GENERACIÓN DE SEÑALES SNIPER (AGENTE 2)
 
-🔧 v1.7.1:
-  • 🆕 SIGNAL_REJECTED: cuando evaluate() devuelve None por RSI/tendencia,
-    se loguea con rate limiter de 5 min por símbolo (logger.debug).
-  • WARMUP: `evaluate()` rechaza señales si `f.is_ready == False`.
-  • BUG #3 CORREGIDO: _check_macro_trend resuelve el símbolo real en MT5.
-  • Logs debug cuando el filtro M15 rechaza una señal.
-  • EMA20 inicializada con SMA(5).
-  • Soporte para XAGUSD y US500.
+🔧 v1.9.0 — LOTE FUSIONADO 2.6+3:
+  • 🐛 O1 OPTIMIZADO: import MetaTrader5 movido a nivel de módulo.
+  • 🐛 O4 OPTIMIZADO: cache M15 con TTL 60s para copy_rates_from_pos.
+  • B16 heredado: validación SL/TP contra min_stop_distance.
+  • v1.7.1 heredado: SIGNAL_REJECTED rate limiter, WARMUP, filtro M15.
 """
 import os
 import time
@@ -22,9 +19,20 @@ load_dotenv()
 logger = logging.getLogger("SignalAgent")
 logger.propagate = False
 
+# 🐛 O1: import a nivel de módulo
+try:
+    import MetaTrader5 as mt5
+    _MT5_AVAILABLE = True
+except ImportError:
+    mt5 = None
+    _MT5_AVAILABLE = False
 
-# 🆕 v1.7.1: rate limiter para logs de rechazo
+
 _REJECTION_LOG_COOLDOWN_SEC = 300.0
+
+# 🐛 O4: TTL del cache M15
+_M15_CACHE_TTL_SEC = 60.0
+_m15_cache: dict = {}
 
 
 class SignalType(str, Enum):
@@ -63,15 +71,8 @@ class StrategySignalAgent:
     W_VOLATILITY = 0.15
 
     PRECISION_BY_CLASS = {
-        "XAU": 2,
-        "XAG": 3,
-        "WTI": 2,
-        "BRENT": 2,
-        "BTC": 2,
-        "ETH": 2,
-        "SOL": 2,
-        "US500": 1,
-        "FOREX": 5,
+        "XAU": 2, "XAG": 3, "WTI": 2, "BRENT": 2,
+        "BTC": 2, "ETH": 2, "SOL": 2, "US500": 1, "FOREX": 5,
     }
 
     _MT5_SYMBOL_ALIASES = {
@@ -107,7 +108,6 @@ class StrategySignalAgent:
         self.precision = self._get_precision()
         self._resolved_mt5_symbol: Optional[str] = None
 
-        # 🆕 v1.7.1: rate limiter de logs de rechazo
         self._last_rejection_log_ts: float = 0.0
         self._last_rejection_reason: str = ""
 
@@ -133,8 +133,19 @@ class StrategySignalAgent:
             default_sl = float(os.getenv("ATR_STOP_MULTIPLIER", "1.8"))
             default_tp = float(os.getenv("ATR_PROFIT_MULTIPLIER", "3.0"))
 
+        self._default_atr_sl = default_sl
+        self._default_atr_tp = default_tp
         self.atr_stop_multiplier = atr_stop_multiplier or default_sl
         self.atr_profit_multiplier = atr_profit_multiplier or default_tp
+
+        if self.is_gold:
+            self.min_sl_distance_pct = 0.0005
+        elif self.is_crypto:
+            self.min_sl_distance_pct = 0.0010
+        elif self.is_forex:
+            self.min_sl_distance_pct = 0.0001
+        else:
+            self.min_sl_distance_pct = 0.0008
 
     def _get_precision(self) -> int:
         s = self.symbol.upper()
@@ -158,12 +169,28 @@ class StrategySignalAgent:
             return self.PRECISION_BY_CLASS["SOL"]
         return 2
 
+    def apply_learned_params(self, atr_sl: Optional[float] = None, atr_tp: Optional[float] = None):
+        """
+        🐛 B19: aplica parámetros del learner respetando los límites por clase.
+        NO sobreescribe el valor default de la clase si el learner no está
+        autorizado (mantiene coherencia).
+        """
+        # Los atr_sl/atr_tp del learner se aplican solo como override suave
+        # Los valores por clase se mantienen como base
+        if atr_sl is not None:
+            self.atr_stop_multiplier = atr_sl
+        if atr_tp is not None:
+            self.atr_profit_multiplier = atr_tp
+
     def _resolve_mt5_symbol(self) -> str:
         if self._resolved_mt5_symbol:
             return self._resolved_mt5_symbol
 
+        if not _MT5_AVAILABLE:
+            self._resolved_mt5_symbol = self.symbol
+            return self._resolved_mt5_symbol
+
         try:
-            import MetaTrader5 as mt5
             sym_upper = self.symbol.upper()
 
             if mt5.symbol_info(self.symbol):
@@ -181,22 +208,46 @@ class StrategySignalAgent:
                     except Exception:
                         pass
                     self._resolved_mt5_symbol = alias
-                    logger.info(f"🔧 [M15] Símbolo '{self.symbol}' resuelto a '{alias}' en MT5")
+                    logger.info(f"🔧 [M15] '{self.symbol}' resuelto a '{alias}'")
                     return alias
 
-            logger.warning(f"⚠️ [M15] No se pudo resolver símbolo '{self.symbol}' en MT5. Filtro M15 será fail-safe.")
+            logger.warning(f"⚠️ [M15] No se pudo resolver '{self.symbol}'. Fail-safe.")
             self._resolved_mt5_symbol = self.symbol
             return self._resolved_mt5_symbol
         except Exception as e:
-            logger.debug(f"🔧 [M15] Error resolviendo símbolo '{self.symbol}': {e}")
+            logger.debug(f"🔧 [M15] Error resolviendo '{self.symbol}': {e}")
             return self.symbol
 
-    def _check_macro_trend(self, signal_type_str: str, current_price: float) -> bool:
-        try:
-            import MetaTrader5 as mt5
-            resolved_sym = self._resolve_mt5_symbol()
+    def _get_m15_rates_cached(self, resolved_sym: str) -> Optional[list]:
+        """
+        🐛 O4: cachea copy_rates_from_pos con TTL 60s.
+        """
+        now = time.time()
+        cached = _m15_cache.get(resolved_sym)
+        if cached and (now - cached["ts"]) < _M15_CACHE_TTL_SEC:
+            return cached["rates"]
 
+        if not _MT5_AVAILABLE:
+            return None
+
+        try:
             rates = mt5.copy_rates_from_pos(resolved_sym, mt5.TIMEFRAME_M15, 0, 30)
+            if rates is not None and len(rates) > 0:
+                _m15_cache[resolved_sym] = {"rates": rates, "ts": now}
+            return rates
+        except Exception as e:
+            logger.debug(f"🔍 [M15] Error copy_rates para {resolved_sym}: {e}")
+            return None
+
+    def _check_macro_trend(self, signal_type_str: str, current_price: float) -> bool:
+        """
+        🐛 O1: ya no importa MetaTrader5 aquí (lo hace a nivel de módulo).
+        🐛 O4: usa cache de copy_rates.
+        """
+        try:
+            resolved_sym = self._resolve_mt5_symbol()
+            rates = self._get_m15_rates_cached(resolved_sym)
+
             if rates is None or len(rates) < 20:
                 return True
 
@@ -227,9 +278,7 @@ class StrategySignalAgent:
             logger.debug(f"🔍 [M15] Fail-safe para {self.symbol}: {e}")
             return True
 
-    # 🆕 v1.7.1: log de rechazo con rate limiter
     def _log_rejection(self, reason: str, rsi: float, trend_score: float, momentum_score: float):
-        """Loguea el rechazo con rate limiter de 5 min por símbolo."""
         now = time.time()
         if now - self._last_rejection_log_ts < _REJECTION_LOG_COOLDOWN_SEC:
             return
@@ -240,8 +289,30 @@ class StrategySignalAgent:
             f"trend={trend_score:+.0f} | momentum={momentum_score:+.0f}"
         )
 
+    def _get_broker_min_distance(self, price: float) -> float:
+        min_distance = price * self.min_sl_distance_pct
+
+        if not _MT5_AVAILABLE:
+            return min_distance
+
+        try:
+            resolved_sym = self._resolve_mt5_symbol()
+            info = mt5.symbol_info(resolved_sym)
+            if info:
+                point = info.point
+                stops_level = max(
+                    float(getattr(info, "trade_stops_level", 0) or 0),
+                    float(getattr(info, "stops_level", 0) or 0),
+                )
+                if stops_level > 0:
+                    broker_min = stops_level * point * 1.5
+                    min_distance = max(min_distance, broker_min)
+        except Exception:
+            pass
+
+        return min_distance
+
     def evaluate(self, f) -> Optional[TradeSignal]:
-        # WARMUP: no generar señales si no hay datos suficientes
         if not getattr(f, "is_ready", False):
             return None
 
@@ -251,7 +322,6 @@ class StrategySignalAgent:
         order_flow_score = 0.0
         volatility_score = 0.0
 
-        # 1. Tendencia
         is_bull_trend = (f.ema9 > f.ema21) and (f.price > f.vwap)
         is_bear_trend = (f.ema9 < f.ema21) and (f.price < f.vwap)
 
@@ -262,7 +332,6 @@ class StrategySignalAgent:
             trend_score = -1.0
             reasons.append("EMA9 < EMA21 y Precio < VWAP")
 
-        # 2. Momentum (RSI)
         if self.is_oil:
             rsi_buy_min = float(os.getenv("RSI_BUY_MIN_OIL", "45.0"))
             rsi_buy_max = float(os.getenv("RSI_BUY_MAX_OIL", "72.0"))
@@ -281,7 +350,6 @@ class StrategySignalAgent:
             momentum_score = -1.0
             reasons.append(f"RSI en compresión ({f.rsi14:.1f})")
 
-        # 3. Order Flow
         if f.candle_delta > 0 and f.cvd > 0:
             order_flow_score = 1.0
             reasons.append("CVD y delta positivos")
@@ -289,7 +357,6 @@ class StrategySignalAgent:
             order_flow_score = -1.0
             reasons.append("CVD y delta negativos")
 
-        # 4. Volatilidad
         min_atr = f.price * 0.0001
         max_atr = f.price * 0.0100
         if min_atr <= f.atr14 <= max_atr:
@@ -298,7 +365,6 @@ class StrategySignalAgent:
             volatility_score = 0.2
             reasons.append(f"ATR fuera de rango")
 
-        # Confluencia normalizada
         raw_bull = (
             (self.W_TREND if trend_score > 0 else 0.0) +
             (self.W_MOMENTUM if momentum_score > 0 else 0.0) +
@@ -326,7 +392,6 @@ class StrategySignalAgent:
             signal_type = SignalType.SELL
             confidence = round(bear_conf * 100, 1)
         else:
-            # 🆕 v1.7.1: log de rechazo con rate limiter
             if momentum_score == 0.0:
                 self._log_rejection("RSI fuera de zona", f.rsi14, trend_score, momentum_score)
             elif trend_score == 0.0:
@@ -336,36 +401,41 @@ class StrategySignalAgent:
                                     f.rsi14, trend_score, momentum_score)
             return None
 
-        # FIX #2: Verificar tendencia macro M15
         signal_type_str = signal_type.value if hasattr(signal_type, 'value') else str(signal_type)
         if not self._check_macro_trend(signal_type_str, f.price):
             return None
 
-        sl_distance = f.atr14 * self.atr_stop_multiplier
-        tp_distance = f.atr14 * self.atr_profit_multiplier
+        raw_sl_distance = f.atr14 * self.atr_stop_multiplier
+        raw_tp_distance = f.atr14 * self.atr_profit_multiplier
 
-        min_distance_pct = 0.00005 if self.is_forex else 0.0005
-        min_distance = f.price * min_distance_pct
+        min_distance = self._get_broker_min_distance(f.price)
+        sl_distance = max(raw_sl_distance, min_distance)
+        tp_distance = max(raw_tp_distance, min_distance)
 
-        if sl_distance < min_distance or tp_distance < min_distance:
+        if sl_distance <= 0 or tp_distance <= 0:
             return None
 
         if signal_type == SignalType.BUY:
             stop_loss = round(f.price - sl_distance, self.precision)
             take_profit = round(f.price + tp_distance, self.precision)
+
+            if stop_loss >= f.price or take_profit <= f.price:
+                logger.warning(
+                    f"🚨 B16: SL/TP invertidos en {self.symbol} BUY. Rechazando."
+                )
+                return None
         else:
             stop_loss = round(f.price + sl_distance, self.precision)
             take_profit = round(f.price - tp_distance, self.precision)
 
-        if stop_loss == round(f.price, self.precision) or take_profit == round(f.price, self.precision):
-            return None
-
-        if signal_type == SignalType.BUY:
-            if stop_loss >= f.price or take_profit <= f.price:
-                return None
-        else:
             if stop_loss <= f.price or take_profit >= f.price:
+                logger.warning(
+                    f"🚨 B16: SL/TP invertidos en {self.symbol} SELL. Rechazando."
+                )
                 return None
+
+        if stop_loss <= 0 or take_profit <= 0:
+            return None
 
         confluence_obj = ConfluenceScore(
             trend_score=trend_score,

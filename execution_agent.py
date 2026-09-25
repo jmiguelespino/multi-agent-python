@@ -1,27 +1,21 @@
 """
 MÓDULO DE EJECUCIÓN INSTITUCIONAL Y OMS (AGENTE 4)
 
-🔧 v1.5:
-  • 🐛 BUG #1 de hora CORREGIDO: `duration_sec` ya no es negativo.
-    Ahora usa `time_utils.mt5_ms_to_epoch()` para convertir `p.time_msc`
-    de MT5 (UTC+3 "disfrazado" de UTC) a epoch UTC real.
-  • 🐛 BUG #4 CORREGIDO: pnl_percent usa contract_size real del símbolo.
-  • 🐛 BUG #5 CORREGIDO: cuando no se encuentran deals para un ticket,
-    se marca como "UNKNOWN" en lugar de "MANUAL_CLOSE" silencioso.
-  • FIX #1: WTI y BRENT unificados como "OIL" en get_canonical_asset().
-  • Soporte para XAG (Plata) y US500 (S&P 500) en canónico.
-  • _update_mt5_sl valida SL contra el precio actual antes de enviar.
-  • Auto-ajuste del SL para respetar stops_level del broker.
-  • Warning de "Invalid stops" solo 1 vez por ticket.
-  • PnL real desde MT5.
-  • log_position_closed correctamente llamado.
+🔧 v1.7.0 — LOTE 2.5 (fixes post-reporte real):
+  • 🐛 B15 CORREGIDO: nuevo método _scan_recent_deals_for_closures() que
+    escanea history_deals_get cada 30s buscando cierres huérfanos
+    (posiciones abiertas y cerradas entre ciclos con throttle de 1s).
+    Se registran como cierres con reason="MANUAL_CLOSE" si no se detectan
+    por sync_mt5_positions.
+  • Lote 2 mantenido (B4: freeze_level + min_stop_distance).
+  • Lote 1 mantenido (B2: sin place_bracket_order; B11: PENDING_PNL).
   • logger.propagate = False.
 """
 import os
 import asyncio
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, Optional, List, Any
 import MetaTrader5 as mt5
@@ -42,10 +36,6 @@ logger.propagate = False
 
 
 def get_canonical_asset(symbol: str) -> str:
-    """
-    🔧 v1.3: WTI y BRENT devuelven "OIL" para unificar exposición.
-    Consistente con risk_guardian.get_canonical_asset() y mt5_bridge.get_canonical_asset().
-    """
     if not symbol:
         return ""
     s = symbol.upper().replace(".RAW", "").replace("_RAW", "").strip()
@@ -59,7 +49,6 @@ def get_canonical_asset(symbol: str) -> str:
         return "XAU"
     if "XAG" in s or "SILVER" in s or "PLATA" in s:
         return "XAG"
-    # 🔧 FIX #1: WTI y BRENT → "OIL" (mismo activo subyacente)
     if "WTI" in s or "XTI" in s or "USO" in s or "CRUDE" in s or "OIL" in s or "PETROLEO" in s:
         return "OIL"
     if "BRENT" in s or "XBR" in s or "UKO" in s:
@@ -78,6 +67,7 @@ class OrderStatus(str, Enum):
     FILLED = "FILLED"
     CANCELED = "CANCELED"
     REJECTED = "REJECTED"
+    PENDING_PNL = "PENDING_PNL"
 
 
 @dataclass
@@ -98,17 +88,31 @@ class BracketOrder:
     entry_timestamp: float = 0.0
     pnl_usd: float = 0.0
     close_price: float = 0.0
+    pnl_fetch_attempts: int = 0
+    pnl_fetch_last_attempt_ts: float = 0.0
+    close_reason_pending: str = "UNKNOWN"
 
 
 class ExecutionOMSAgent:
+    PNL_MAX_FETCH_ATTEMPTS = 6
+    PNL_RETRY_BACKOFF_BASE_SEC = 2.0
+
+    # 🆕 B15: cada cuántos segundos escanear deals en busca de cierres huérfanos
+    DEALS_SCAN_INTERVAL_SEC = 30.0
+    # 🆕 B15: ventana de tiempo hacia atrás para buscar deals
+    DEALS_SCAN_LOOKBACK_MIN = 5
+
     def __init__(self, taker_fee_pct: float = 0.0004, maker_fee_pct: float = 0.0002):
         self.taker_fee_pct = taker_fee_pct
         self.maker_fee_pct = maker_fee_pct
         self.active_orders: Dict[str, BracketOrder] = {}
         self.closed_orders: List[BracketOrder] = []
         self._reported_tickets: set = set()
-
         self._sl_warning_shown: set = set()
+
+        # 🆕 B15: estado del escaneo de deals
+        self._last_deals_scan_ts: float = 0.0
+        self._processed_deal_tickets: set = set()
 
         self.be_trigger_atr = float(os.getenv("BREAK_EVEN_ATR_TRIGGER", "1.2"))
         self.be_lock_atr = float(os.getenv("BREAK_EVEN_LOCK_ATR", "0.10"))
@@ -116,12 +120,11 @@ class ExecutionOMSAgent:
         self.trail_dist_atr = float(os.getenv("TRAILING_STOP_ATR_DISTANCE", "1.8"))
         self.magic_number = int(os.getenv("MAGIC_NUMBER", "992026"))
 
+    # -------------------------------------------------------------------------
+    # Helpers
+    # -------------------------------------------------------------------------
     @staticmethod
     def _get_contract_size(symbol: str) -> float:
-        """
-        🐛 BUG #4 CORREGIDO: obtiene el contract_size real del símbolo desde MT5.
-        Fallback a valores conocidos si MT5 no está disponible.
-        """
         try:
             info = mt5.symbol_info(symbol)
             if info and getattr(info, "trade_contract_size", 0) > 0:
@@ -143,13 +146,43 @@ class ExecutionOMSAgent:
         return 1.0
 
     @staticmethod
-    def _fetch_realized_pnl_from_mt5(ticket: int, max_retries: int = 3, retry_delay: float = 0.5) -> tuple[float, float, str]:
+    def _get_min_stop_distance(symbol: str) -> tuple[float, float]:
         """
-        Obtiene el PnL real de un ticket cerrado desde el historial de MT5.
+        🐛 B4: devuelve (min_distance_sl_tp, freeze_distance) en unidades de
+        precio leyendo TODOS los campos relevantes del broker.
+        """
+        try:
+            info = mt5.symbol_info(symbol)
+            if not info:
+                return 0.0, 0.0
 
-        🐛 BUG #6 CORREGIDO: MT5 puede tardar en reflejar deals recién cerrados.
-        Se añaden reintentos con backoff para dar tiempo al historial.
-        """
+            point = info.point
+
+            stops_level = max(
+                float(getattr(info, "trade_stops_level", 0) or 0),
+                float(getattr(info, "stops_level", 0) or 0),
+            )
+            freeze_level = max(
+                float(getattr(info, "trade_freeze_level", 0) or 0),
+                float(getattr(info, "freeze_level", 0) or 0),
+            )
+
+            if stops_level <= 0 and freeze_level <= 0:
+                stops_level = 50.0
+
+            min_distance = stops_level * point
+            freeze_distance = freeze_level * point
+
+            return min_distance, freeze_distance
+        except Exception:
+            return 0.0, 0.0
+
+    @staticmethod
+    def _fetch_realized_pnl_from_mt5(
+        ticket: int,
+        max_retries: int = 3,
+        retry_delay: float = 0.5
+    ) -> tuple[float, float, str]:
         try:
             from datetime import datetime, timedelta, timezone as _tz
             tz_mt5 = _tz(timedelta(hours=3))
@@ -158,18 +191,16 @@ class ExecutionOMSAgent:
 
             deals = None
             for attempt in range(max_retries):
-                # Intento 1: pedir deals específicos del position_id
                 deals = mt5.history_deals_get(from_date, to_date, position=ticket)
 
                 if not deals or len(deals) == 0:
-                    # Intento 2: fallback, pedir todos y filtrar
                     all_deals = mt5.history_deals_get(from_date, to_date)
                     if all_deals:
                         deals = [d for d in all_deals
                                  if (getattr(d, "position_id", None) or getattr(d, "position", None)) == ticket]
 
                 if deals and len(deals) > 0:
-                    break  # Encontrado, salir del bucle
+                    break
 
                 if attempt < max_retries - 1:
                     logger.debug(
@@ -177,7 +208,7 @@ class ExecutionOMSAgent:
                         f"(intento {attempt+1}/{max_retries}, esperando {retry_delay:.1f}s)"
                     )
                     time.sleep(retry_delay)
-                    retry_delay *= 2  # Backoff exponencial
+                    retry_delay *= 2
 
             if not deals:
                 logger.warning(
@@ -223,20 +254,129 @@ class ExecutionOMSAgent:
             logger.error(f"Error obteniendo PnL real del ticket #{ticket}: {e}")
             return 0.0, 0.0, "UNKNOWN"
 
+    # -------------------------------------------------------------------------
+    # 🆕 B15: escaneo de deals para detectar cierres huérfanos
+    # -------------------------------------------------------------------------
+    def _scan_recent_deals_for_closures(self, risk_guardian: Optional[Any] = None):
+        """
+        🆕 B15: escanea los deals recientes de MT5 y detecta cierres que
+        sync_mt5_positions() pudo haber perdido (posiciones abiertas y
+        cerradas entre ciclos con throttle de 1s).
+
+        Cada DEALS_SCAN_INTERVAL_SEC:
+          - Consulta history_deals_get de los últimos DEALS_SCAN_LOOKBACK_MIN min.
+          - Filtra DEAL_ENTRY_OUT.
+          - Para cada uno, si su position_id NO está en closed_orders ni
+            active_orders → registrar como cierre huérfano.
+        """
+        now = time.time()
+        if now - self._last_deals_scan_ts < self.DEALS_SCAN_INTERVAL_SEC:
+            return
+        self._last_deals_scan_ts = now
+
+        try:
+            from datetime import datetime, timedelta, timezone as _tz
+            tz_mt5 = _tz(timedelta(hours=3))
+            from_date = datetime.now(tz_mt5) - timedelta(minutes=self.DEALS_SCAN_LOOKBACK_MIN)
+            to_date = datetime.now(tz_mt5) + timedelta(minutes=1)
+
+            deals = mt5.history_deals_get(from_date, to_date)
+            if not deals:
+                return
+
+            # Tickets ya conocidos (en active_orders o closed_orders)
+            known_tickets: set = set()
+            for o in self.closed_orders:
+                if o.order_id and o.order_id.isdigit():
+                    known_tickets.add(int(o.order_id))
+            for oid in self.active_orders.keys():
+                if oid.isdigit():
+                    known_tickets.add(int(oid))
+
+            orphan_closures = []
+            for d in deals:
+                if getattr(d, "entry", None) != mt5.DEAL_ENTRY_OUT:
+                    continue
+                pid = getattr(d, "position_id", None) or getattr(d, "position", None)
+                if not pid or pid in known_tickets:
+                    continue
+                if d.ticket in self._processed_deal_tickets:
+                    continue
+                orphan_closures.append(d)
+
+            if not orphan_closures:
+                return
+
+            logger.info(f"🩹 B15: {len(orphan_closures)} cierre(s) huérfano(s) detectado(s). Procesando...")
+
+            for d in orphan_closures:
+                pid = getattr(d, "position_id", None) or getattr(d, "position", None)
+                self._processed_deal_tickets.add(d.ticket)
+
+                # Reconstruir info del cierre
+                pnl_usd, close_price, close_reason = self._fetch_realized_pnl_from_mt5(
+                    pid, max_retries=1, retry_delay=0.0
+                )
+                if close_reason == "UNKNOWN":
+                    close_reason = "MANUAL_CLOSE"
+
+                symbol = getattr(d, "symbol", "UNKNOWN")
+                volume = getattr(d, "volume", 0.0)
+
+                # DEAL_TYPE_BUY en un cierre significa que la posición era SELL
+                deal_type = getattr(d, "type", None)
+                if deal_type == mt5.DEAL_TYPE_BUY:
+                    side = "SELL"
+                elif deal_type == mt5.DEAL_TYPE_SELL:
+                    side = "BUY"
+                else:
+                    side = "UNKNOWN"
+
+                logger.warning(
+                    f"🩹 B15: cierre huérfano #{pid} {symbol} {side} {volume} | "
+                    f"PnL=${pnl_usd:.2f} | reason={close_reason} | "
+                    f"(no estaba en active_orders ni closed_orders)"
+                )
+
+                log_position_closed(
+                    symbol=symbol,
+                    side=side,
+                    volume=volume,
+                    entry_price=0.0,   # desconocido
+                    exit_price=close_price,
+                    pnl_usd=pnl_usd,
+                    pnl_percent=0.0,
+                    reason=close_reason,
+                    ticket=pid,
+                    order_id=str(pid),
+                    duration_sec=0,
+                    is_test=False
+                )
+
+                if risk_guardian:
+                    risk_guardian.register_trade_closed(pnl_usd=pnl_usd, symbol=symbol)
+
+        except Exception as e:
+            logger.debug(f"B15: error escaneando deals: {e}")
+
+    # -------------------------------------------------------------------------
+    # Sincronización con MT5
+    # -------------------------------------------------------------------------
     def sync_mt5_positions(self, raw_positions, risk_guardian: Optional[Any] = None):
         if raw_positions is None:
             raw_positions = []
 
+        # 🆕 B15: escanear deals primero (por si hay cierres huérfanos)
+        self._scan_recent_deals_for_closures(risk_guardian)
+
         current_tickets = {str(p.ticket) for p in raw_positions}
 
+        # 1. Detectar ABIERTAS
         for p in raw_positions:
             order_key = str(p.ticket)
             side = "BUY" if p.type == mt5.ORDER_TYPE_BUY else "SELL"
 
             if order_key not in self.active_orders:
-                # 🐛 BUG #1 de hora CORREGIDO:
-                # p.time_msc viene en hora MT5 (UTC+3) "disfrazada" de UTC.
-                # mt5_ms_to_epoch() lo convierte a epoch UTC real.
                 entry_time = mt5_ms_to_epoch(p.time_msc) if hasattr(p, 'time_msc') and p.time_msc else time.time()
 
                 order = BracketOrder(
@@ -251,6 +391,10 @@ class ExecutionOMSAgent:
                     entry_timestamp=entry_time
                 )
                 self.active_orders[order_key] = order
+
+                # 🆕 B10: notificar al RiskGuardian que la posición fue confirmada
+                if risk_guardian and hasattr(risk_guardian, "notify_position_confirmed"):
+                    risk_guardian.notify_position_confirmed(p.symbol)
 
             if order_key not in self._reported_tickets:
                 self._reported_tickets.add(order_key)
@@ -269,52 +413,104 @@ class ExecutionOMSAgent:
                     order_id=order_key
                 )
 
+        # 2. Detectar CERRADAS
+        now = time.time()
         for order_id in list(self.active_orders.keys()):
-            if order_id.isdigit() and order_id not in current_tickets:
-                closed_order = self.active_orders.pop(order_id)
-                ticket_int = int(order_id)
+            if not order_id.isdigit():
+                continue
 
+            if order_id in current_tickets:
+                continue
+
+            closed_order = self.active_orders[order_id]
+            ticket_int = int(order_id)
+
+            if closed_order.status == OrderStatus.PENDING_PNL:
+                elapsed = now - closed_order.pnl_fetch_last_attempt_ts
+                backoff = self.PNL_RETRY_BACKOFF_BASE_SEC * (2 ** closed_order.pnl_fetch_attempts)
+                if elapsed < backoff:
+                    continue
+
+                if closed_order.pnl_fetch_attempts >= self.PNL_MAX_FETCH_ATTEMPTS:
+                    logger.error(
+                        f"❌ Ticket #{ticket_int}: no se pudo obtener PnL tras "
+                        f"{self.PNL_MAX_FETCH_ATTEMPTS} intentos. Se registra como 0.0/UNKNOWN."
+                    )
+                    pnl_usd, close_price, close_reason = 0.0, closed_order.close_price, "UNKNOWN"
+                else:
+                    pnl_usd, close_price, close_reason = self._fetch_realized_pnl_from_mt5(
+                        ticket_int, max_retries=1, retry_delay=0.0
+                    )
+                    closed_order.pnl_fetch_attempts += 1
+                    closed_order.pnl_fetch_last_attempt_ts = now
+
+                    if close_reason == "UNKNOWN":
+                        logger.info(
+                            f"⏳ Ticket #{ticket_int}: PnL aún no disponible en MT5 "
+                            f"(intento {closed_order.pnl_fetch_attempts}/{self.PNL_MAX_FETCH_ATTEMPTS})."
+                        )
+                        continue
+            else:
                 pnl_usd, close_price, close_reason = self._fetch_realized_pnl_from_mt5(ticket_int)
-                closed_order.pnl_usd = pnl_usd
-                closed_order.close_price = close_price
-                closed_order.status = OrderStatus.CANCELED
-                self.closed_orders.append(closed_order)
 
-                if order_id in self._reported_tickets:
-                    self._reported_tickets.remove(order_id)
+                if close_reason == "UNKNOWN":
+                    closed_order.status = OrderStatus.PENDING_PNL
+                    closed_order.pnl_fetch_attempts = 1
+                    closed_order.pnl_fetch_last_attempt_ts = now
+                    closed_order.close_price = close_price
+                    closed_order.close_reason_pending = "UNKNOWN"
+                    logger.info(
+                        f"⏳ Ticket #{ticket_int}: cerrado pero PnL no disponible. "
+                        f"Marcado como PENDING_PNL (intento 1/{self.PNL_MAX_FETCH_ATTEMPTS})."
+                    )
+                    continue
 
-                if risk_guardian:
-                    risk_guardian.register_trade_closed(pnl_usd=pnl_usd, symbol=closed_order.symbol)
+            # PnL confirmado
+            closed_order = self.active_orders.pop(order_id)
+            closed_order.pnl_usd = pnl_usd
+            closed_order.close_price = close_price
+            closed_order.status = OrderStatus.CANCELED
+            closed_order.close_reason_pending = close_reason
+            self.closed_orders.append(closed_order)
 
-                # 🐛 BUG #4 CORREGIDO: pnl_percent con contract_size real
-                contract_size = self._get_contract_size(closed_order.symbol)
-                notional = closed_order.entry_price * closed_order.quantity * contract_size
-                pnl_percent = (pnl_usd / notional) * 100.0 if notional > 0 else 0.0
+            if order_id in self._reported_tickets:
+                self._reported_tickets.remove(order_id)
 
-                # 🐛 BUG #1 de hora CORREGIDO:
-                # entry_timestamp ya es epoch UTC real, así que time.time() - entry_timestamp
-                # da una duración correcta (positiva).
-                duration_sec = int(time.time() - closed_order.entry_timestamp) if closed_order.entry_timestamp else 0
+            if risk_guardian:
+                risk_guardian.register_trade_closed(pnl_usd=pnl_usd, symbol=closed_order.symbol)
 
-                log_position_closed(
-                    symbol=closed_order.symbol,
-                    side=closed_order.side,
-                    volume=closed_order.quantity,
-                    entry_price=closed_order.entry_price,
-                    exit_price=close_price,
-                    pnl_usd=pnl_usd,
-                    pnl_percent=round(pnl_percent, 2),
-                    reason=close_reason,
-                    ticket=ticket_int,
-                    order_id=order_id,
-                    duration_sec=duration_sec
-                )
-                logger.info(
-                    f"📉 Posición cerrada #{ticket_int} {closed_order.symbol} | "
-                    f"PnL: ${pnl_usd:.2f} | Razón: {close_reason} | Duración: {duration_sec}s"
-                )
+            contract_size = self._get_contract_size(closed_order.symbol)
+            notional = closed_order.entry_price * closed_order.quantity * contract_size
+            pnl_percent = (pnl_usd / notional) * 100.0 if notional > 0 else 0.0
 
+            duration_sec = int(time.time() - closed_order.entry_timestamp) if closed_order.entry_timestamp else 0
+
+            log_position_closed(
+                symbol=closed_order.symbol,
+                side=closed_order.side,
+                volume=closed_order.quantity,
+                entry_price=closed_order.entry_price,
+                exit_price=close_price,
+                pnl_usd=pnl_usd,
+                pnl_percent=round(pnl_percent, 2),
+                reason=close_reason,
+                ticket=ticket_int,
+                order_id=order_id,
+                duration_sec=duration_sec
+            )
+            logger.info(
+                f"📉 Posición cerrada #{ticket_int} {closed_order.symbol} | "
+                f"PnL: ${pnl_usd:.2f} | Razón: {close_reason} | Duración: {duration_sec}s"
+            )
+
+    # -------------------------------------------------------------------------
+    # Modificación de SL en MT5
+    # -------------------------------------------------------------------------
     def _update_mt5_sl(self, ticket_id: str, symbol: str, new_sl: float, current_tp: float):
+        """
+        🐛 B4: usa _get_min_stop_distance() que lee trade_stops_level Y
+        trade_freeze_level. Respeta el freeze_level.
+        """
         if not ticket_id.isdigit():
             return
 
@@ -332,13 +528,24 @@ class ExecutionOMSAgent:
             if not tick or not info:
                 return
 
-            stops_level = (
-                getattr(info, "stops_level", None)
-                or getattr(info, "trade_stops_level", None)
-                or 0
-            )
-            min_distance = max(stops_level * info.point, info.point * 50)
+            min_distance, freeze_distance = self._get_min_stop_distance(symbol)
 
+            # 🆕 B4: verificar freeze_level ANTES de intentar modificar
+            if freeze_distance > 0:
+                if pos.type == mt5.ORDER_TYPE_BUY:
+                    distance_to_freeze = abs(tick.bid - pos.price_open)
+                else:
+                    distance_to_freeze = abs(tick.ask - pos.price_open)
+
+                if distance_to_freeze < freeze_distance:
+                    logger.debug(
+                        f"🧊 Ticket #{ticket}: precio dentro del freeze_level "
+                        f"({distance_to_freeze:.5f} < {freeze_distance:.5f}). "
+                        f"Modificación de SL pospuesta."
+                    )
+                    return
+
+            # Ajustar SL para respetar la distancia mínima
             if pos.type == mt5.ORDER_TYPE_BUY:
                 if new_sl >= tick.bid - min_distance:
                     adjusted_sl = round(tick.bid - min_distance, info.digits)
@@ -381,49 +588,22 @@ class ExecutionOMSAgent:
         current_market_price: float,
         stop_loss: float,
         take_profit: float
-    ) -> BracketOrder:
-        order_id = f"SNIPER-{int(time.time()*1000)}"
-        slippage_bps = 0.4 + (quantity * 0.05)
-        slippage_factor = slippage_bps / 10000.0
-
-        fill_price = current_market_price * (1.0 + slippage_factor) if side == "BUY" else current_market_price * (1.0 - slippage_factor)
-        fill_price = round(fill_price, 2)
-
-        commission = round(quantity * fill_price * self.taker_fee_pct, 2)
-        slippage_usd = round(abs(fill_price - current_market_price) * quantity, 2)
-
-        order = BracketOrder(
-            order_id=order_id,
-            symbol=symbol,
-            side=side,
-            quantity=quantity,
-            entry_price=fill_price,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            status=OrderStatus.FILLED,
-            slippage_usd=slippage_usd,
-            commission_usd=commission,
-            entry_timestamp=time.time()
+    ) -> None:
+        """🐛 B2: stub deprecado. La posición se detecta en sync_mt5_positions."""
+        logger.debug(
+            f"ℹ️ place_bracket_order llamado para {symbol} {side} {quantity} "
+            f"(deprecado — sync_mt5_positions gestionará la posición)"
         )
-
-        self.active_orders[order_id] = order
-        log_order_filled(
-            symbol=symbol,
-            side=side,
-            volume=quantity,
-            fill_price=fill_price,
-            sl=stop_loss,
-            tp=take_profit,
-            order_id=order_id,
-            metadata={"commission_usd": commission, "slippage_usd": slippage_usd}
-        )
-        return order
+        return None
 
     def update_tick_price(self, order_id: str, tick_symbol: str, current_price: float, atr: float) -> Optional[str]:
         if order_id not in self.active_orders:
             return None
 
         order = self.active_orders[order_id]
+
+        if order.status == OrderStatus.PENDING_PNL:
+            return None
 
         if order.symbol != tick_symbol and get_canonical_asset(order.symbol) != get_canonical_asset(tick_symbol):
             return None
